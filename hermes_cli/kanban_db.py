@@ -234,6 +234,23 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel exit code a kanban worker returns when its run failed purely
+# because the *inference backend* was unavailable — the provider returned
+# server_error / overloaded / connection-timeout after exhausting retries, or
+# (for the local MLX fleet) the M3 server hit its Metal buffer-COUNT ceiling
+# and wedged (`[metal::malloc] Resource limit (499000) exceeded`). Like the
+# rate-limit sentinel, this is NOT a task failure: the card is fine, the
+# backend just needs to recover (watchdog / preflight restart clears the
+# wedge). The dispatcher's reap classifier maps this to an ``infra_unavailable``
+# exit kind so ``detect_crashed_workers`` releases the task back to ``ready``
+# WITHOUT counting a failure (the circuit breaker must never trip because the
+# GPU server fell over), and ``check_respawn_guard`` spaces the retries out by
+# a short cooldown so the board keeps cheaply probing for recovery instead of
+# hammering a still-wedged worker every tick. 69 == BSD ``EX_UNAVAILABLE``
+# (sysexits.h) — "service unavailable" — semantically exact for a downed
+# inference endpoint, and clear of 0/1/2 and the 75 rate-limit sentinel.
+KANBAN_INFRA_UNAVAILABLE_EXIT_CODE = 69
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -274,6 +291,54 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _resolve_infra_unavailable_cooldown_seconds() -> int:
+    """Return the infra-unavailable requeue cooldown in seconds.
+
+    Reads ``HERMES_KANBAN_INFRA_COOLDOWN_SECONDS`` from the environment; falls
+    back to ``DEFAULT_INFRA_UNAVAILABLE_COOLDOWN_SECONDS`` when absent, empty,
+    non-integer, or negative. A value of 0 disables the cooldown (re-spawn on
+    the next tick). Shorter than the rate-limit cooldown by default: a downed
+    inference endpoint is recovered by the watchdog / preflight restart in
+    seconds-to-a-minute, not a multi-minute provider quota window, so the board
+    should probe for recovery more often.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_INFRA_COOLDOWN_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_INFRA_UNAVAILABLE_COOLDOWN_SECONDS
+
+
+def _resolve_crash_cooldown_seconds() -> int:
+    """Return the crashed-run respawn cooldown in seconds.
+
+    Reads ``HERMES_KANBAN_CRASH_COOLDOWN_SECONDS`` from the environment; falls
+    back to ``DEFAULT_CRASH_COOLDOWN_SECONDS`` when absent, empty, non-integer,
+    or negative. A value of 0 disables the cooldown (re-spawn on the next
+    tick, the pre-2026-07-24 behavior). See the constant's comment for why
+    crashed runs are spaced at all: a backend wedge can present as a silent
+    rc=0 protocol violation, and immediate retries burn the whole failure
+    budget inside the same wedge window.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_CRASH_COOLDOWN_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_CRASH_COOLDOWN_SECONDS
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -5900,6 +5965,31 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Cooldown after an infra-unavailable (inference-backend-down / OOM-wedge)
+# requeue before the dispatcher re-spawns the worker. Shorter than the
+# rate-limit cooldown: the local MLX fleet recovers via the launchd KeepAlive /
+# external watchdog / 07:50 preflight restart within seconds-to-a-minute, so a
+# tighter probe cadence gets the pipeline moving again quickly once the backend
+# is healthy — without re-dispatching onto a still-wedged worker every tick.
+# Overridable via ``HERMES_KANBAN_INFRA_COOLDOWN_SECONDS``.
+DEFAULT_INFRA_UNAVAILABLE_COOLDOWN_SECONDS = 60  # 1 minute
+
+# Cooldown after a ``crashed`` run (including rc=0 protocol violations) before
+# the dispatcher re-spawns the worker. Rationale: an inference-side failure can
+# present as a SILENT stream truncation — the worker ends its turn without a
+# terminal kanban call and exits 0, so the run is classified ``crashed`` (not
+# ``infra_unavailable``) and every retry fires on the next tick, straight into
+# the same wedged/recovering backend window that killed the previous run.
+# Observed 2026-07-23: both retries of a finalize task burned 60s apart inside
+# a ~2-minute MLX Metal-wedge window, tripping the breaker 45s before the
+# watchdog restarted the backend. Unlike the rate-limit / infra paths, crashed
+# runs STILL count consecutive failures — the circuit breaker trips exactly as
+# before; the cooldown only spaces the attempts so at least one retry lands on
+# a recovered backend. Explicit operator requeues (unblock / reclaim) bypass
+# it. Overridable via ``HERMES_KANBAN_CRASH_COOLDOWN_SECONDS``; 0 disables
+# (pre-2026-07-24 behavior).
+DEFAULT_CRASH_COOLDOWN_SECONDS = 300  # 5 minutes
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -5962,6 +6052,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    infra_unavailable: list[str] = field(default_factory=list)
+    """Task ids whose workers bailed because the inference backend was down
+    (EX_UNAVAILABLE sentinel exit — provider server_error/overloaded/timeout
+    after exhausted retries, or a local MLX Metal-buffer wedge) and were
+    released back to ``ready`` WITHOUT counting a failure. Like ``rate_limited``
+    these never trip the circuit breaker — a downed GPU server just makes the
+    task bounce cheaply (spaced by the infra cooldown) until it recovers."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6020,6 +6117,14 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"infra_unavailable"`` — ``WIFEXITED`` with status
+      ``KANBAN_INFRA_UNAVAILABLE_EXIT_CODE``. The worker bailed because the
+      inference backend was down (server_error / overloaded / timeout after
+      exhausted retries, or a local MLX Metal-buffer wedge), NOT because the
+      task failed. Handled exactly like ``rate_limited`` — released back to
+      ``ready`` without counting a failure, respawn spaced by a short cooldown
+      so the board probes for backend recovery instead of hammering a wedged
+      worker.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -6041,6 +6146,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_INFRA_UNAVAILABLE_EXIT_CODE:
+                return ("infra_unavailable", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -6617,7 +6724,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "infra_unavailable"):
+            # Neutral, like a quota wall: a downed inference backend says
+            # nothing about the task, so it neither consumes nor extends the
+            # protocol-violation streak (same treatment as the unified
+            # ``consecutive_failures`` counter, which this path never ticks).
             continue
         if outcome == "crashed":
             is_violation = False
@@ -6665,9 +6776,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows the worker exited with the infra-unavailable
+    sentinel (``KANBAN_INFRA_UNAVAILABLE_EXIT_CODE``), the inference backend was
+    down (provider server_error / overloaded / timeout after exhausted retries,
+    or a local MLX Metal-buffer wedge), NOT a task failure. Handled identically
+    to the rate-limit path: released back to ``ready`` WITHOUT counting a
+    failure and stamped with an infra-blocker error so ``check_respawn_guard``
+    defers the respawn by a short cooldown while the backend recovers. Returned
+    via the ``_last_infra_unavailable`` function attribute.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    infra_unavailable: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -6701,6 +6822,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            infra_unavailable_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -6748,6 +6870,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "infra_unavailable":
+                # Worker bailed because the inference backend was down
+                # (EX_UNAVAILABLE sentinel): provider server_error / overloaded
+                # / timeout after exhausted retries, or a local MLX Metal-buffer
+                # wedge. This is NOT a task failure — the card is fine, the GPU
+                # server just fell over. Release it back to ``ready`` so the
+                # respawn guard defers it by the infra cooldown while the
+                # backend recovers, and — exactly as for the rate-limit wall —
+                # do NOT count a failure (skip ``_record_task_failure``) so a
+                # downed backend can't trip the circuit breaker and permanently
+                # block the card.
+                protocol_violation = False
+                infra_unavailable_exit = True
+                error_text = (
+                    f"pid {pid} exited infra-unavailable (inference backend "
+                    f"down / OOM wedge) — requeued without counting a failure"
+                )
+                event_kind = "infra_unavailable"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -6770,10 +6915,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited / infra-unavailable requeues are a clean
+                # release, not a crash — record the run outcome accordingly so
+                # the board history doesn't show a phantom crash for a quota
+                # wall or a downed inference backend.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif infra_unavailable_exit:
+                    _run_outcome = "infra_unavailable"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -6796,6 +6947,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif infra_unavailable_exit:
+                    # Same clean-release treatment as the rate-limit wall: stamp
+                    # the infra-blocker error (``check_respawn_guard`` keys the
+                    # cooldown off the ``infra_unavailable`` run outcome, not
+                    # this text — the ``_RESPAWN_BLOCKER_RE`` deliberately does
+                    # NOT match it, so once the cooldown elapses the task
+                    # respawns for a cheap recovery probe) and DO NOT count a
+                    # failure so a downed backend can't trip the breaker.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    infra_unavailable.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -6905,6 +7069,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # And for infra-unavailable requeues (downed inference backend / OOM wedge)
+    # — identical clean-release semantics: no failure counted, not a crash.
+    detect_crashed_workers._last_infra_unavailable = infra_unavailable  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7154,6 +7321,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+    ``"infra_unavailable_cooldown"``
+        The task's most recent run ended with the ``infra_unavailable`` outcome
+        (the inference backend fell over — provider server_error/overloaded/
+        timeout after exhausted retries, or a local MLX Metal-buffer wedge)
+        within ``_resolve_infra_unavailable_cooldown_seconds()``. Defer the
+        respawn until the (short) cooldown elapses so the board keeps cheaply
+        probing for backend recovery instead of hammering a still-wedged worker
+        every tick. Symmetric to ``rate_limit_cooldown``; this path likewise
+        never increments ``consecutive_failures``, so it retries forever (spaced
+        by the cooldown) until the backend recovers or a real run supersedes it.
+
+    ``"crash_cooldown"``
+        The task's most recent run ended ``crashed`` (worker died, or exited
+        rc=0 without a terminal kanban call — the protocol violation) within
+        ``_resolve_crash_cooldown_seconds()``. A wedged backend can present as
+        exactly this (silent stream truncation, never classified infra), so
+        immediate respawns burn the whole failure budget inside the wedge
+        window. Unlike the two cooldowns above, crashed runs DO count
+        ``consecutive_failures`` — the breaker semantics are unchanged, only
+        the attempt spacing. Bypassed by an explicit operator requeue
+        (``unblocked`` / ``reclaimed`` event after the crash); NOT bypassed by
+        ``promoted``, which the crash-requeue path itself emits.
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -7225,6 +7415,61 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
         return None
+
+    # 1b. Infra-unavailable cooldown. Symmetric to the rate-limit cooldown
+    #     above: the most recent run ended ``infra_unavailable`` (the inference
+    #     backend fell over — provider server_error/overloaded/timeout after
+    #     exhausted retries, or a local MLX Metal-buffer wedge). Defer while
+    #     inside the (shorter) infra cooldown window, then allow a cheap
+    #     recovery probe. Like the rate-limit path this retries forever, spaced
+    #     by the cooldown, until the backend is healthy or a real
+    #     crash/completion supersedes it — the breaker never trips on a downed
+    #     GPU server because this path never incremented ``consecutive_failures``.
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "infra_unavailable"
+    ):
+        infra_cooldown = _resolve_infra_unavailable_cooldown_seconds()
+        if infra_cooldown <= 0:
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < infra_cooldown:
+            return "infra_unavailable_cooldown"
+        return None
+
+    # 1c. Crash cooldown. The most recent run ended ``crashed`` (worker died
+    #     or exited without a terminal kanban call — the rc=0 protocol
+    #     violation). A backend wedge can present exactly like this (silent
+    #     stream truncation → clean exit, never classified infra), and an
+    #     immediate respawn then fires straight into the same wedge window and
+    #     burns the failure budget in seconds. Space the retries so at least
+    #     one lands on a recovered backend. UNLIKE 1a/1b this path still
+    #     counts consecutive_failures (the breaker trips exactly as before)
+    #     and, once the cooldown elapses, FALLS THROUGH to the remaining
+    #     checks instead of returning early — a crashed run's failure text may
+    #     legitimately match blocker_auth. Explicit operator requeues
+    #     (unblock / reclaim) bypass the wait; 'promoted' does NOT bypass,
+    #     because the crash-requeue path itself re-promotes the task.
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "crashed"
+    ):
+        crash_cooldown = _resolve_crash_cooldown_seconds()
+        ended_at = latest_run["ended_at"]
+        if (
+            crash_cooldown > 0
+            and ended_at is not None
+            and (now - int(ended_at)) < crash_cooldown
+        ):
+            requeued_after = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, int(ended_at)),
+            ).fetchone()
+            if not requeued_after:
+                return "crash_cooldown"
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
@@ -7459,6 +7704,15 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Infra-unavailable requeues (downed inference backend / OOM wedge, no
+    # failure counted) — surface for telemetry / tests. These went back to
+    # ``ready`` and the respawn guard defers them by the infra cooldown while
+    # the backend recovers.
+    _crash_infra_unavailable = getattr(
+        detect_crashed_workers, "_last_infra_unavailable", []
+    )
+    if _crash_infra_unavailable:
+        result.infra_unavailable.extend(_crash_infra_unavailable)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

@@ -1063,6 +1063,242 @@ def test_resolve_rate_limit_cooldown_handles_bad_env(monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Infra-unavailable requeue (L3 dispatcher fix): a worker that bails because
+# the *inference backend* fell over (provider server_error/overloaded/timeout
+# after exhausted retries, or a local MLX Metal-buffer wedge) must be released
+# back to ``ready`` WITHOUT counting a failure, so a downed GPU server can't
+# trip the circuit breaker and permanently block the card. The respawn guard
+# then defers it on a short cooldown until the backend recovers. Symmetric to
+# the rate-limit carve-out above. Regression coverage for the M3 OOM-wedge that
+# blocked the daily wiki pipeline 2026-07-20/07-21.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_recognizes_infra_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(
+        pid, _exited_status(_kb.KANBAN_INFRA_UNAVAILABLE_EXIT_CODE)
+    )
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "infra_unavailable"
+    assert code == _kb.KANBAN_INFRA_UNAVAILABLE_EXIT_CODE
+
+    # The infra sentinel is distinct from the rate-limit sentinel and from a
+    # generic non-zero crash.
+    assert _kb.KANBAN_INFRA_UNAVAILABLE_EXIT_CODE != _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    _kb._record_worker_exit(pid + 1, _exited_status(1))
+    assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def test_infra_exit_requeues_without_counting_failure(kanban_home, monkeypatch):
+    """An infra-unavailable sentinel exit releases the task to ``ready`` and
+    leaves ``consecutive_failures`` untouched — the breaker must never trip
+    because the inference backend fell over, even across many hits."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="infra", assignee="a")
+
+        # Far more backend-down hits than DEFAULT_FAILURE_LIMIT (2). If any
+        # counted as a failure the task would be blocked.
+        for i in range(6):
+            pid = 80000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_INFRA_UNAVAILABLE_EXIT_CODE)
+            )
+
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid not in crashed, f"hit {i}: infra requeue is not a crash"
+            infra = getattr(
+                _kb.detect_crashed_workers, "_last_infra_unavailable", []
+            )
+            assert tid in infra, f"hit {i}: should surface on infra side-channel"
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: infra-down must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        assert task.last_failure_error and "infra-unavailable" in task.last_failure_error
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "infra_unavailable" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_respawn_guard_defers_infra_within_cooldown(kanban_home, monkeypatch):
+    """Within the cooldown after an infra requeue, the guard defers the
+    respawn; after the cooldown it allows a probe (returns None) rather than
+    parking the task forever."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_INFRA_COOLDOWN_SECONDS", "60")
+    now = 7_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="infra-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='infra_unavailable', "
+            "status='infra_unavailable', ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited infra-unavailable (inference backend down)", tid),
+        )
+        conn.commit()
+
+        # Inside cooldown → defer with the infra-specific reason.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 30)
+        assert kb.check_respawn_guard(conn, tid) == "infra_unavailable_cooldown"
+
+        # Past cooldown → allowed (None), not trapped forever.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 90)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_resolve_infra_cooldown_handles_bad_env(monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    for bad_val in ("notanumber", "-5", ""):
+        monkeypatch.setenv("HERMES_KANBAN_INFRA_COOLDOWN_SECONDS", bad_val)
+        assert (
+            _kb._resolve_infra_unavailable_cooldown_seconds()
+            == _kb.DEFAULT_INFRA_UNAVAILABLE_COOLDOWN_SECONDS
+        )
+
+
+def _stamp_crashed_run(conn, tid, ended_at):
+    """Claim + end the current run as ``crashed`` and requeue the task ready,
+    the same shape ``detect_crashed_workers`` leaves behind."""
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome='crashed', status='crashed', "
+        "ended_at=? WHERE id=?",
+        (ended_at, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, "
+        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+        "last_failure_error=? WHERE id=?",
+        (
+            "worker exited cleanly (rc=0) without calling kanban_complete "
+            "or kanban_block — protocol violation.",
+            tid,
+        ),
+    )
+    conn.commit()
+
+
+def test_respawn_guard_defers_crashed_within_cooldown(kanban_home, monkeypatch):
+    """A crashed run (incl. the rc=0 protocol violation a wedged backend
+    produces) is respawned only after the crash cooldown, so retries don't
+    fire straight into the same wedge window; past the cooldown it respawns
+    normally (falls through, no early return)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_COOLDOWN_SECONDS", "300")
+    now = 7_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crash-guard", assignee="a")
+        _stamp_crashed_run(conn, tid, now)
+
+        # Inside cooldown → defer with the crash-specific reason.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+        assert kb.check_respawn_guard(conn, tid) == "crash_cooldown"
+
+        # Past cooldown → allowed (None), breaker semantics untouched.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 301)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_crash_cooldown_operator_bypass(kanban_home, monkeypatch):
+    """An explicit operator requeue (unblocked/reclaimed event AFTER the
+    crash) bypasses the crash cooldown; the 'promoted' event the crash-requeue
+    path itself emits does NOT."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_COOLDOWN_SECONDS", "300")
+    now = 7_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crash-guard-bypass", assignee="a")
+        _stamp_crashed_run(conn, tid, now)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+
+        # 'promoted' after the crash (auto re-queue) must NOT bypass.
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'promoted', NULL, ?)",
+            (tid, now + 1),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "crash_cooldown"
+
+        # 'unblocked' after the crash (operator action) bypasses.
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'unblocked', NULL, ?)",
+            (tid, now + 2),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_crash_cooldown_disabled(kanban_home, monkeypatch):
+    """HERMES_KANBAN_CRASH_COOLDOWN_SECONDS=0 restores the pre-cooldown
+    behavior: crashed runs respawn on the next tick."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_COOLDOWN_SECONDS", "0")
+    now = 7_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crash-guard-off", assignee="a")
+        _stamp_crashed_run(conn, tid, now)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 1)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_resolve_crash_cooldown_handles_bad_env(monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    for bad_val in ("notanumber", "-5", ""):
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_COOLDOWN_SECONDS", bad_val)
+        assert (
+            _kb._resolve_crash_cooldown_seconds()
+            == _kb.DEFAULT_CRASH_COOLDOWN_SECONDS
+        )
+
+
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 

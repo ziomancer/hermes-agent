@@ -78,6 +78,26 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Substrings that mark an exhausted-retries failure as an *inference backend*
+# problem (the server fell over) rather than a task/prompt problem, even when
+# the generic classifier lands on ``FailoverReason.unknown``. These are the
+# signatures a local MLX / mlx_vlm fleet server emits when it wedges — most
+# importantly the Metal buffer-COUNT ceiling (``[metal::malloc] Resource limit
+# (499000) exceeded``) that pins the shared M3 worker until it is restarted,
+# and the bare "error occurred during streaming" a wedged server returns to the
+# client. When one of these is the terminal error, the kanban worker exits with
+# the infra-unavailable sentinel so the dispatcher requeues the task without
+# counting a failure (see cli.py and hermes_cli/kanban_db.py). Matched against
+# the lowercased error string, so keep entries lowercase.
+_INFRA_BACKEND_ERROR_SIGNATURES = (
+    "metal::malloc",
+    "resource limit",
+    "an error occurred during streaming",
+    "error occurred during streaming",
+    "generation failed",
+    "unable to create tensor",
+)
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -4148,6 +4168,26 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    # Surface the classified reason so callers (notably the
+                    # kanban worker path in cli.py) can distinguish a transient
+                    # backend problem from a real task failure and choose a
+                    # different exit code. ``rate_limit`` / ``billing`` mean
+                    # "quota wall"; ``server_error`` / ``overloaded`` /
+                    # ``timeout`` mean "backend fell over" — both are
+                    # "not a task error". When the generic classifier lands on
+                    # ``unknown`` but the terminal error carries a local
+                    # inference-backend signature (e.g. the M3 Metal-buffer
+                    # wedge), override to the synthetic ``provider_unavailable``
+                    # reason so the kanban worker still exits with the
+                    # infra-unavailable sentinel instead of a plain failure.
+                    _failure_reason = classified.reason.value
+                    if _failure_reason not in (
+                        "rate_limit", "billing", "server_error",
+                        "overloaded", "timeout", "upstream_rate_limit",
+                    ) and any(
+                        sig in error_msg for sig in _INFRA_BACKEND_ERROR_SIGNATURES
+                    ):
+                        _failure_reason = "provider_unavailable"
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -4155,12 +4195,7 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _final_summary,
-                        # Surface the classified reason so callers (notably the
-                        # kanban worker path in cli.py) can distinguish a
-                        # transient throttle from a real failure and choose a
-                        # different exit code. ``rate_limit`` / ``billing`` here
-                        # mean "quota wall, not a task error".
-                        "failure_reason": classified.reason.value,
+                        "failure_reason": _failure_reason,
                     }
 
                 # For rate limits, respect the Retry-After header if present

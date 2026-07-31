@@ -16390,14 +16390,40 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
+                            _fr = result.get("failure_reason")
+                            if os.environ.get("HERMES_KANBAN_TASK") and _fr in (
+                                "rate_limit", "billing"
+                            ):
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
                                     )
                                     _exit_code = _RL_CODE
+                                except Exception:
+                                    _exit_code = 1
+                            elif os.environ.get("HERMES_KANBAN_TASK") and _fr in (
+                                # Inference backend down, NOT a task failure. The
+                                # dispatcher maps this sentinel to an
+                                # ``infra_unavailable`` requeue (no failure
+                                # counted, short respawn cooldown) so a downed
+                                # GPU server / OOM-wedge can't trip the circuit
+                                # breaker and block the card. ``server_error`` /
+                                # ``overloaded`` / ``timeout`` /
+                                # ``upstream_rate_limit`` are the FailoverReason
+                                # values the classifier assigns to a provider
+                                # that fell over; ``provider_unavailable`` is the
+                                # synthetic reason the conversation loop stamps
+                                # when retries exhaust with no response on an
+                                # infra-class error (the local MLX Metal-buffer
+                                # wedge lands here).
+                                "server_error", "overloaded", "timeout",
+                                "upstream_rate_limit", "provider_unavailable",
+                            ):
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_INFRA_UNAVAILABLE_EXIT_CODE as _INFRA_CODE,
+                                    )
+                                    _exit_code = _INFRA_CODE
                                 except Exception:
                                     _exit_code = 1
                         sys.exit(_exit_code)
