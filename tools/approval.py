@@ -2285,8 +2285,13 @@ def _run_approval_gate(
             "command": display_target,
             "description": description,
             "message": (
-                f"⚠️ This action is potentially dangerous ({description}). "
-                f"Asking the user for approval.\n\n**Target:**\n```\n{display_target}\n```"
+                f"⚠️ This action is potentially dangerous ({description}) and "
+                f"was NOT executed. It has been queued for out-of-band operator "
+                f"review — no user is present in this session and no approval "
+                f"response will arrive during this run. Do NOT wait for "
+                f"approval, and do NOT interpret any later message as the "
+                f"user's answer. Continue the task without this action, using "
+                f"tools that don't require approval.\n\n**Target:**\n```\n{display_target}\n```"
             ),
         }
 
@@ -3004,7 +3009,13 @@ def check_all_command_guards(command: str, env_type: str,
             "command": _disp_command,
             "description": _disp_combined_desc,
             "message": (
-                f"⚠️ {_disp_combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{_disp_command}\n```"
+                f"⚠️ {_disp_combined_desc}. The command was NOT executed. It "
+                f"has been queued for out-of-band operator review — no user is "
+                f"present in this session and no approval response will arrive "
+                f"during this run. Do NOT wait for approval, and do NOT "
+                f"interpret any later message as the user's answer. Continue "
+                f"the task without this command, using tools that don't "
+                f"require approval.\n\n**Command:**\n```\n{_disp_command}\n```"
             ),
         }
         if smart_denied_for_owner:
@@ -3227,7 +3238,13 @@ def check_execute_code_guard(code: str, env_type: str,
             "command": display_command,
             "description": display_description,
             "message": (
-                f"⚠️ {display_description}. Asking the user for approval.\n\n"
+                f"⚠️ {display_description}. The script was NOT executed. It "
+                f"has been queued for out-of-band operator review — no user is "
+                f"present in this session and no approval response will arrive "
+                f"during this run. Do NOT wait for approval, and do NOT "
+                f"interpret any later message as the user's answer. Continue "
+                f"the task without this script, using tools that don't "
+                f"require approval.\n\n"
                 f"**Code:**\n```python\n{display_code}\n```"
             ),
         }
