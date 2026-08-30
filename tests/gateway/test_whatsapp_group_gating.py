@@ -414,3 +414,88 @@ def test_is_broadcast_chat_helper_recognizes_common_jids():
     assert WhatsAppAdapter._is_broadcast_chat("120363001234567890@g.us") is False
     assert WhatsAppAdapter._is_broadcast_chat("") is False
     assert WhatsAppAdapter._is_broadcast_chat(None) is False  # type: ignore[arg-type]
+
+
+# --- Gated-context buffering (require_mention → channel_context backfill) ---
+
+def _make_buffering_adapter(**kwargs):
+    adapter = _make_adapter(**kwargs)
+    adapter._gated_context = {}
+    return adapter
+
+
+def test_gated_group_message_is_buffered_and_drained():
+    adapter = _make_buffering_adapter(
+        require_mention=True, group_policy="open")
+
+    msg = _group_message(body="just chatting", senderName="Cody")
+    assert adapter._should_process_message(msg) is False
+    adapter._buffer_gated_group_message(msg)
+
+    ctx = adapter._drain_gated_context(msg["chatId"])
+    assert ctx is not None
+    assert ctx.startswith("[Recent group messages (not addressed to you)]")
+    assert "[Cody] just chatting" in ctx
+    # Drain empties the buffer.
+    assert adapter._drain_gated_context(msg["chatId"]) is None
+
+
+def test_gated_buffer_skips_disallowed_group():
+    adapter = _make_buffering_adapter(
+        require_mention=True, group_policy="allowlist",
+        group_allow_from=["120363999999999999@g.us"])
+
+    msg = _group_message(body="not our group")
+    adapter._buffer_gated_group_message(msg)
+    assert adapter._drain_gated_context(msg["chatId"]) is None
+
+
+def test_gated_buffer_skips_fromme_echo():
+    adapter = _make_buffering_adapter(require_mention=True, group_policy="open")
+
+    msg = _group_message(body="my own outbound", fromMe=True)
+    adapter._buffer_gated_group_message(msg)
+    assert adapter._drain_gated_context(msg["chatId"]) is None
+
+
+def test_gated_buffer_keeps_owner_typed_message():
+    adapter = _make_buffering_adapter(require_mention=True, group_policy="open")
+
+    msg = _group_message(body="owner aside", fromMe=True, fromOwner=True,
+                         senderName="Owner")
+    adapter._buffer_gated_group_message(msg)
+    ctx = adapter._drain_gated_context(msg["chatId"])
+    assert ctx is not None and "[Owner] owner aside" in ctx
+
+
+def test_gated_buffer_skips_broadcast_and_dm():
+    adapter = _make_buffering_adapter(require_mention=True, group_policy="open")
+
+    adapter._buffer_gated_group_message(
+        _group_message(body="status", chatId="status@broadcast"))
+    adapter._buffer_gated_group_message(_dm_message(body="dm text"))
+    assert adapter._gated_context == {}
+
+
+def test_gated_buffer_caps_at_max_and_uses_sender_fallback():
+    adapter = _make_buffering_adapter(require_mention=True, group_policy="open")
+    chat_id = _group_message()["chatId"]
+
+    for i in range(adapter._GATED_CONTEXT_MAX + 5):
+        adapter._buffer_gated_group_message(
+            _group_message(body=f"m{i}", senderId="15551239999@s.whatsapp.net"))
+
+    buf = adapter._gated_context[chat_id]
+    assert len(buf) == adapter._GATED_CONTEXT_MAX
+    # Oldest rolled off, newest kept; senderName fallback = bare number.
+    assert buf[-1] == f"[15551239999] m{adapter._GATED_CONTEXT_MAX + 4}"
+    assert all(line.startswith("[15551239999]") for line in buf)
+
+
+def test_media_only_gated_message_buffers_placeholder():
+    adapter = _make_buffering_adapter(require_mention=True, group_policy="open")
+
+    msg = _group_message(body="", hasMedia=True, senderName="Cody")
+    adapter._buffer_gated_group_message(msg)
+    ctx = adapter._drain_gated_context(msg["chatId"])
+    assert ctx is not None and "[Cody] [media]" in ctx

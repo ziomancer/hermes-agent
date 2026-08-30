@@ -24,6 +24,7 @@ import signal
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
+from collections import deque
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -411,6 +412,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
         self._mention_patterns = self._compile_mention_patterns()
+        # Per-chat ring buffers of group messages dropped by the mention gate
+        # (require_mention).  Drained into MessageEvent.channel_context on the
+        # next processed message from that chat so the agent still sees the
+        # conversation it was not addressed in.  Mirrors Discord's
+        # history-backfill, but buffered at intake because Baileys cannot
+        # re-fetch chat history on demand.
+        self._gated_context: Dict[str, deque] = {}
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
         self._bridge_log: Optional[Path] = None
@@ -1296,6 +1304,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            # A later trigger in the same debounce window may have drained
+            # gated context that the merged event would otherwise lose.
+            if getattr(event, "channel_context", None):
+                if getattr(existing, "channel_context", None):
+                    existing.channel_context = (
+                        f"{existing.channel_context}\n{event.channel_context}"
+                    )
+                else:
+                    existing.channel_context = event.channel_context
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -1327,10 +1344,62 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
+    # Cap per-chat gated-context buffers.  30 messages ≈ a busy hour of group
+    # chatter; older lines roll off so a quiet week never floods one prompt.
+    _GATED_CONTEXT_MAX = 30
+
+    def _buffer_gated_group_message(self, data: Dict[str, Any]) -> None:
+        """Remember a group message that the mention gate dropped.
+
+        Only messages that passed the group allowlist but failed the
+        require_mention check are kept — allowlist-rejected chats and
+        broadcast pseudo-chats never buffer, and neither do our own
+        (``fromMe``) echoes.  Best-effort: a failure here must never break
+        message intake.
+        """
+        try:
+            if not data.get("isGroup"):
+                return
+            if data.get("fromMe") and not data.get("fromOwner"):
+                return
+            chat_id = str(data.get("chatId") or "")
+            if not chat_id or self._is_broadcast_chat(chat_id):
+                return
+            if not self._is_group_allowed(chat_id):
+                return
+            body = str(data.get("body") or "").strip()
+            if not body:
+                if not data.get("hasMedia"):
+                    return
+                body = "[media]"
+            sender = str(data.get("senderName") or "").strip()
+            if not sender:
+                sender = str(data.get("senderId") or "").split("@", 1)[0] or "unknown"
+            buf = self._gated_context.setdefault(
+                chat_id, deque(maxlen=self._GATED_CONTEXT_MAX)
+            )
+            buf.append(f"[{sender}] {body}")
+        except Exception as e:
+            print(f"[{self.name}] gated-context buffer error: {e}", flush=True)
+
+    def _drain_gated_context(self, chat_id: Any) -> Optional[str]:
+        """Pop and format buffered unaddressed messages for one chat.
+
+        Returns a block suitable for ``MessageEvent.channel_context`` (the
+        runner prepends it ahead of the trigger message), or ``None`` when
+        nothing was buffered.
+        """
+        buf = self._gated_context.pop(str(chat_id or ""), None)
+        if not buf:
+            return None
+        lines = "\n".join(buf)
+        return f"[Recent group messages (not addressed to you)]\n{lines}"
+
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
             if not self._should_process_message(data):
+                self._buffer_gated_group_message(data)
                 return None
 
             # Determine message type
@@ -1515,6 +1584,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_text=reply_to_text,
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
+                channel_context=(
+                    self._drain_gated_context(data.get("chatId"))
+                    if is_group
+                    else None
+                ),
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
