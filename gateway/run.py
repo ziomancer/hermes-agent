@@ -58,6 +58,15 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.private_boundary import (
+    BoundaryRuntimeOwners,
+    PrivateBoundaryError,
+    boundary_construction_scope,
+    canonical_home,
+    load_boundary_policy,
+)
+
+_PRIVATE_BOUNDARY_JOIN_TIMEOUT = 30.0
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -1813,6 +1822,31 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _retire_quietly(runtime) -> None:
+    """Retire a private runtime while preserving fatal interruption semantics.
+
+    An ``Exception`` raised by retirement is logged by type and swallowed so
+    the caller's active error handling can continue. A non-``Exception``
+    ``BaseException`` is logged and re-raised from no cause; when another
+    non-``Exception`` ``BaseException`` is already active, that cancellation or
+    interrupt is re-raised instead, also from no cause.
+    """
+    active_error = sys.exception()
+    try:
+        runtime.retire()
+    except BaseException as retire_error:
+        logger.warning(
+            "Private boundary runtime retirement failed: type=%s",
+            type(retire_error).__name__,
+        )
+        if not isinstance(retire_error, Exception):
+            if isinstance(active_error, BaseException) and not isinstance(
+                active_error, Exception
+            ):
+                raise active_error from None
+            raise retire_error from None
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -2830,8 +2864,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _startup_restore_in_progress: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
+        try:
+            self._initialize(config)
+        except BaseException:
+            owners = getattr(self, "_private_boundary_owners", None)
+            if owners is not None:
+                owners.close_unstarted()
+            raise
+
+    def _initialize(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
+        self._private_boundary_home = get_hermes_home().resolve()
+        load_boundary_policy(self._private_boundary_home)
+        self._private_boundary_owners = BoundaryRuntimeOwners()
+        self._private_boundary_owners.get_or_open(self._private_boundary_home)
         self.config = config or load_gateway_config()
+        if self.config.multiplex_profiles:
+            from hermes_cli.profiles import profiles_to_serve
+
+            for _, profile_home in profiles_to_serve(multiplex=True):
+                self._private_boundary_owners.get_or_open(profile_home)
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -3370,6 +3422,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
             )
 
+    async def _disconnect_private_adapter(self, adapter) -> None:
+        runtime = adapter._private_boundary
+        if adapter._private_transport_released:
+            return
+        task = adapter._private_disconnect_task
+        if task is None:
+            task = asyncio.create_task(adapter.close_private_transport())
+            adapter._private_disconnect_task = task
+        try:
+            done, _ = await asyncio.wait({task}, timeout=_PRIVATE_BOUNDARY_JOIN_TIMEOUT)
+            if task not in done or task.cancelled() or task.result() is not True:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY")
+            runtime.release_transport(adapter, adapter._private_transport_generation)
+            adapter._private_transport_released = True
+        except Exception as error:
+            logger.warning(
+                "Private boundary adapter disconnect failed: type=%s",
+                type(error).__name__,
+            )
+            # Log before retirement so a raising retirement cannot hide the failure.
+            _retire_quietly(runtime)
+            # Retain both the task and exact transport binding after failure.
+            # Shutdown may proceed, but private ownership cannot be released.
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY") from None
+        except BaseException:
+            _retire_quietly(runtime)
+            raise
+
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
 
@@ -3381,6 +3461,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Must tolerate partial-init state and never raise, since callers
         use it inside error-handling blocks.
         """
+        if getattr(adapter, "_private_boundary", None) is not None:
+            try:
+                await self._disconnect_private_adapter(adapter)
+            except PrivateBoundaryError:
+                logger.error("PRIVATE_BOUNDARY_NOT_READY")
+            return
         timeout = self._adapter_disconnect_timeout_secs()
         try:
             if timeout <= 0:
@@ -3417,6 +3503,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         and force forward progress; the loop never hangs regardless of any
         adapter's internal behavior. Never raises.
         """
+        if getattr(adapter, "_private_boundary", None) is not None:
+            await self._safe_adapter_disconnect(adapter, platform)
+            return
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
@@ -3485,6 +3574,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
     async def _connect_adapter_with_timeout(
+        self, adapter, platform, *, is_reconnect: bool = False
+    ) -> bool:
+        runtime = getattr(adapter, "_private_boundary", None)
+        if runtime is None:
+            return await self._connect_platform_adapter_with_timeout(
+                adapter, platform, is_reconnect=is_reconnect,
+            )
+        try:
+            if runtime.state == "RECOVERING":
+                await runtime.recover()
+            runtime.assert_ready()
+            result = await self._connect_platform_adapter_with_timeout(
+                adapter, platform, is_reconnect=is_reconnect,
+            )
+            runtime.assert_ready()
+            if result is not True:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+            return True
+        except Exception as error:
+            try:
+                if isinstance(error, PrivateBoundaryError):
+                    if error.context:
+                        logger.warning(
+                            "Private boundary adapter connect failed: type=%s code=%s context=%s",
+                            type(error).__name__,
+                            error.code,
+                            error.context,
+                        )
+                    else:
+                        logger.warning(
+                            "Private boundary adapter connect failed: type=%s code=%s",
+                            type(error).__name__,
+                            error.code,
+                        )
+                else:
+                    logger.warning(
+                        "Private boundary adapter connect failed: type=%s",
+                        type(error).__name__,
+                    )
+            finally:
+                # Log before retirement so a raising retirement cannot hide the failure,
+                # and retire in this finally clause so a raising log sink can no longer
+                # skip retirement. Both guarantees hold together here.
+                _retire_quietly(runtime)
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
+        except BaseException:
+            _retire_quietly(runtime)
+            raise
+
+    async def _connect_platform_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False
     ) -> bool:
         """Connect an adapter without allowing one platform to block others.
@@ -4072,7 +4211,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the same object twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
-            await adapter.disconnect()
+            if getattr(adapter, "_private_boundary", None) is not None:
+                try:
+                    await self._disconnect_private_adapter(adapter)
+                except PrivateBoundaryError as exc:
+                    self._failed_platforms.pop(adapter.platform, None)
+                    self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+                    self._request_clean_exit(exc.code)
+                    return
+            else:
+                await adapter.disconnect()
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -6813,11 +6961,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return True
 
     async def start(self) -> bool:
+        """Start with fixed required-boundary failures and owned cleanup."""
+        try:
+            return await self._start_impl()
+        except PrivateBoundaryError as exc:
+            try:
+                await self.stop()
+            finally:
+                self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+                self._request_clean_exit(exc.code)
+            return True
+
+    async def _start_impl(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
         
         Returns True if at least one adapter connected successfully.
         """
+        owners = getattr(self, "_private_boundary_owners", None)
+        if owners is not None:
+            await owners.recover()
         logger.info("Starting Hermes Gateway...")
         try:
             self._gateway_loop = asyncio.get_running_loop()
@@ -7241,6 +7404,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
                         }
+            except PrivateBoundaryError:
+                await self._safe_adapter_disconnect(adapter, platform)
+                raise
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
                 # Same defensive cleanup path for exceptions — an adapter
@@ -7270,7 +7436,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _secondary_connected = await self._start_secondary_profile_adapters()
             connected_count += _secondary_connected
-        except MultiplexConfigError as e:
+        except (MultiplexConfigError, PrivateBoundaryError) as e:
             # Invalid multiplexer config — abort startup cleanly so the operator
             # fixes config.yaml rather than running a half-wired gateway.
             reason = str(e)
@@ -8097,6 +8263,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # etc.) already drop out of the queue via the
                         # `not fatal_error_retryable` branch above, so anything
                         # reaching here is by definition retryable.
+                except PrivateBoundaryError as e:
+                    if adapter is not None:
+                        await self._safe_adapter_disconnect(adapter, platform)
+                    self._failed_platforms.pop(platform, None)
+                    self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+                    self._request_clean_exit(e.code)
+                    return
                 except Exception as e:
                     if adapter is not None:
                         # An exception escaping the connect call path
@@ -8380,18 +8553,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
+            teardown_attempted = set()
             for platform, adapter in list(self.adapters.items()):
+                teardown_attempted.add(id(adapter))
                 await self._bounded_adapter_teardown(adapter, platform)
 
             # Disconnect secondary-profile adapters (multiplex mode).
             for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
                 for platform, adapter in list(_amap.items()):
+                    teardown_attempted.add(id(adapter))
                     await self._bounded_adapter_teardown(
                         adapter, platform, profile=_prof
                     )
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
                 self._profile_adapters.clear()
+            owners = getattr(self, "_private_boundary_owners", None)
+            if owners is not None:
+                try:
+                    # A constructor can bind before it raises, leaving no
+                    # adapter in either routing map. The runtime still owns
+                    # that exact child; attempt real join before store close.
+                    for adapter in owners.transports_for_shutdown():
+                        if id(adapter) not in teardown_attempted:
+                            await self._safe_adapter_disconnect(adapter, None)
+                    await owners.close()
+                except PrivateBoundaryError:
+                    # Failed producer join keeps the runtime owner reachable.
+                    # Do not replace it or turn shutdown into a clean restart.
+                    self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+                    self._restart_requested = False
+                    logger.error("PRIVATE_BOUNDARY_NOT_READY")
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
@@ -8620,7 +8812,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
                 )
-            except MultiplexConfigError:
+            except (MultiplexConfigError, PrivateBoundaryError):
                 # Config error (e.g. a secondary profile binding a port) is not
                 # transient — propagate so startup aborts cleanly instead of
                 # limping along with a half-configured multiplexer.
@@ -8703,13 +8895,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         owner, profile_name, platform.value, platform.value,
                     )
                     await self._safe_adapter_disconnect(adapter, platform)
+                    if getattr(adapter, "_private_boundary", None) is not None:
+                        raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
                     continue
                 claimed[(platform, fp)] = profile_name
 
             # Stamp every inbound event from this adapter with its profile so
             # the agent turn (and session key) resolve to the right home.
             adapter.set_message_handler(
-                self._make_profile_message_handler(profile_name)
+                self._make_profile_message_handler(profile_name, profile_home)
             )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -8728,14 +8922,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
                     await self._safe_adapter_disconnect(adapter, platform)
+            except PrivateBoundaryError:
+                await self._safe_adapter_disconnect(adapter, platform)
+                raise
             except Exception as e:
                 logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
-    def _make_profile_message_handler(self, profile_name: str):
+    def _make_profile_message_handler(self, profile_name: str, profile_home=None):
         """Return a message handler that stamps source.profile then delegates."""
         async def _handler(event):
+            if profile_home is not None and load_boundary_policy(profile_home).required:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_message(event)
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
                     event.source.profile = profile_name
@@ -8770,6 +8970,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
+        self, platform: Platform, config: Any,
+    ) -> Optional[BasePlatformAdapter]:
+        """Resolve required authority before entering optional platform factories."""
+        home = canonical_home(
+            get_hermes_home_override()
+            or getattr(self, "_private_boundary_home", get_hermes_home())
+        )
+        policy = load_boundary_policy(home)
+        owners = getattr(self, "_private_boundary_owners", None)
+        runtime = owners.get_or_open(home) if owners is not None else None
+        if not policy.required:
+            return self._create_platform_adapter(platform, config)
+        if runtime is None:
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_UNAVAILABLE")
+        try:
+            with boundary_construction_scope(runtime):
+                adapter = self._create_platform_adapter(platform, config)
+            if (adapter is None or getattr(adapter, "_private_boundary", None) is not runtime
+                    or not getattr(adapter, "supports_private_boundary", False)):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+            return adapter
+        except Exception:
+            _retire_quietly(runtime)
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
+
+    def _create_platform_adapter(
         self, 
         platform: Platform, 
         config: Any
@@ -8793,7 +9019,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.platform_registry import platform_registry
             if platform_registry.is_registered(platform.value):
-                adapter = platform_registry.create_adapter(platform.value, config)
+                if load_boundary_policy(get_hermes_home()).required:
+                    adapter = platform_registry.create_adapter(
+                        platform.value, config, required_boundary=True,
+                    )
+                else:
+                    adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
                     # Adapters that need a back-reference to the gateway runner
                     # (e.g. for cross-platform admin alerts) declare a
@@ -8810,7 +9041,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value,
                 )
                 return None
+        except PrivateBoundaryError:
+            raise
         except Exception as e:
+            if load_boundary_policy(get_hermes_home()).required:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
             logger.debug("Platform registry lookup for '%s' failed: %s", platform.value, e)
         # Fall through to built-in adapters below
 
@@ -8970,6 +9205,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        private_home = canonical_home(
+            get_hermes_home_override() or getattr(self, "_private_boundary_home", get_hermes_home())
+        )
+        if self._private_boundary_owners.requires_boundary(private_home):
+            from hermes_cli.private_conversation import AcceptedTurn
+            if not isinstance(getattr(event, "private_turn", None), AcceptedTurn):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+            runtime = self._private_boundary_owners.get_or_open(private_home)
+
+            def create_agent(context):
+                from run_agent import AIAgent
+                with _profile_runtime_scope(private_home):
+                    return AIAgent(boundary_context=context, platform="whatsapp")
+
+            with _profile_runtime_scope(private_home):
+                return await runtime.run_handoff(event.private_turn, create_agent)
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -18784,7 +19035,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return f"[user did not respond within {int(timeout / 60)}m]"
                 return response
 
-            agent.clarify_callback = _clarify_callback_sync
+            if getattr(_status_adapter, "_private_boundary", None) is None:
+                agent.clarify_callback = _clarify_callback_sync
 
             # Show assistant thinking between tool calls — independent of
             # tool_progress mode. Mattermost needs an explicit per-platform
@@ -20842,7 +21094,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    try:
+        runner = GatewayRunner(config)
+    except PrivateBoundaryError as exc:
+        logger.error("%s", exc.code)
+        raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from None
     
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service

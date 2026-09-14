@@ -199,7 +199,7 @@ class PlatformRegistry:
             return
         self._deferred[name] = loader
 
-    def _resolve(self, name: str) -> None:
+    def _resolve(self, name: str, *, required_boundary: bool = False) -> None:
         """Run the deferred loader for *name* if one is pending."""
         loader = self._deferred.pop(name, None)
         if loader is None:
@@ -207,6 +207,10 @@ class PlatformRegistry:
         try:
             loader()
         except Exception as e:
+            if required_boundary:
+                from hermes_cli.private_boundary import PrivateBoundaryError
+
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
             logger.warning(
                 "Deferred load of platform '%s' failed: %s",
                 name,
@@ -275,7 +279,9 @@ class PlatformRegistry:
         # from triggering a heavy import.
         return name in self._entries or name in self._deferred
 
-    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
+    def create_adapter(
+        self, name: str, config: Any, *, required_boundary: bool = False,
+    ) -> Optional[Any]:
         """Create an adapter instance for the given platform name.
 
         Returns None if:
@@ -285,12 +291,20 @@ class PlatformRegistry:
         - The factory raises an exception
         """
         if name not in self._entries:
-            self._resolve(name)
+            self._resolve(name, required_boundary=required_boundary)
         entry = self._entries.get(name)
         if entry is None:
             return None
 
-        if not entry.check_fn():
+        try:
+            available = entry.check_fn()
+        except Exception:
+            if required_boundary:
+                from hermes_cli.private_boundary import PrivateBoundaryError
+
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
+            raise
+        if not available:
             hint = f" ({entry.install_hint})" if entry.install_hint else ""
             logger.warning(
                 "Platform '%s' requirements not met%s",
@@ -308,6 +322,10 @@ class PlatformRegistry:
                     )
                     return None
             except Exception as e:
+                if required_boundary:
+                    from hermes_cli.private_boundary import PrivateBoundaryError
+
+                    raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
                 logger.warning(
                     "Platform '%s' config validation error: %s",
                     entry.label,
@@ -319,6 +337,10 @@ class PlatformRegistry:
             adapter = entry.adapter_factory(config)
             return adapter
         except Exception as e:
+            if required_boundary:
+                from hermes_cli.private_boundary import PrivateBoundaryError
+
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE") from None
             logger.error(
                 "Failed to create adapter for platform '%s': %s",
                 entry.label,

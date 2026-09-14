@@ -2880,6 +2880,9 @@ DEFAULT_CONFIG = {
         "force_ipv4": False,
     },
 
+    # Required boundaries are supplied by an explicitly installed private plugin.
+    "privacy_boundary": {"required": False, "adapter": None, "api_version": 1},
+
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {

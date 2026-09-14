@@ -544,3 +544,21 @@ def finalize_turn(
         logger.warning("on_session_end hook failed: %s", exc)
 
     return result
+
+
+def finalize_private_turn(agent, messages, *, status, api_call_count):
+    """Commit private history; return only a fixed projection and opaque result."""
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.message_sanitization import close_interrupted_tool_sequence
+    from hermes_cli.private_conversation import PRIVATE_MARKER
+
+    context = agent._private_boundary_context
+    repair_message_sequence(agent, messages)
+    if status != "completed":
+        close_interrupted_tool_sequence(messages)
+    result = context.persist(messages, status=status)
+    projection = [{"role": "assistant", "content": PRIVATE_MARKER}]
+    agent._last_messages = projection
+    return {"final_response": PRIVATE_MARKER, "messages": projection,
+            "failed": status == "failed", "interrupted": status == "cancelled",
+            "api_calls": api_call_count, "boundary_result": result}

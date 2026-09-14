@@ -281,6 +281,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    boundary_context=None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -300,6 +301,9 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    if boundary_context is not None:
+        from hermes_cli.private_conversation import require_conversation
+        return require_conversation(boundary_context).definitions()
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -1037,6 +1041,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    boundary_context=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1062,6 +1067,13 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    if boundary_context is not None:
+        from hermes_cli.private_conversation import require_conversation
+        return require_conversation(boundary_context).execute_tool(function_name, function_args)
+    from hermes_cli.private_boundary import load_boundary_policy, PrivateBoundaryError
+    from hermes_constants import get_hermes_home
+    if load_boundary_policy(get_hermes_home()).required:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

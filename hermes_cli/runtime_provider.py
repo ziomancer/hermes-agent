@@ -1529,6 +1529,12 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    from hermes_cli.private_boundary import load_boundary_policy, PrivateBoundaryError
+    from hermes_constants import get_hermes_home
+    if load_boundary_policy(get_hermes_home()).required:
+        # Required callers use create_private_runtime_provider with authenticated
+        # conversation context, never ordinary credential/fallback resolution.
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
     requested_provider = resolve_requested_provider(requested)
 
     if requested_provider == "moa":
@@ -2088,3 +2094,85 @@ def format_runtime_provider_error(error: Exception) -> str:
     if isinstance(error, AuthError):
         return format_auth_error(error)
     return str(error)
+
+
+def create_private_runtime_provider(boundary_context):
+    """Resolve only the captured checked caller; construct no unrestricted SDK."""
+    from hermes_cli.private_conversation import require_conversation
+    return require_conversation(boundary_context)
+
+
+def checked_private_provider_call(context, messages, *, purpose="conversation"):
+    """Prepare immutable bytes, then invoke the private audited dispatch owner.
+
+    The private dispatcher consumes its single-use permit and starts an owned
+    operation under its audit/health mutex. Its join contract, not Future state
+    or caller cancellation, determines when the runtime LOCAL gate is released.
+    """
+    import json
+    from hermes_cli.private_boundary import PrivateBoundaryError
+    from hermes_cli.private_conversation import (
+        PreparedProviderRequest, completed, encoded, require_conversation,
+    )
+
+    context = require_conversation(context)
+    context.assert_execution()
+    if purpose not in {"conversation", "compaction", "image", "synthesis"}:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+    prompt = (context.policy.compaction_prompt if purpose == "compaction"
+              else context.policy.system_prompt)
+    request = {"model": context.policy.model,
+               "messages": [{"role": "system", "content": prompt}, *messages],
+               "tools": context.definitions()}
+    # One bounded waiter and one actual LOCAL producer, shared by all purposes.
+    # Preparation can select LOCAL, so acquire before any prepare/audit/permit.
+    gate = context.runtime._local_call_gate
+    waiter = context.runtime._local_call_waiter
+    if not waiter.acquire(blocking=False):
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY")
+    acquired = False
+    try:
+        acquired = gate.acquire(timeout=5)
+    finally:
+        waiter.release()
+    if not acquired:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY")
+    try:
+        context.assert_execution()
+        prepared = completed(context._backend.prepare(
+            encoded(request), context._resolved, purpose,
+        ))
+        if (not isinstance(prepared, PreparedProviderRequest)
+                or prepared.disposition not in {"LOCAL", "HOSTED"}
+                or prepared.purpose != purpose or prepared.run_id != context._resolved.run_id
+                or not isinstance(prepared.endpoint, str) or not prepared.endpoint
+                or prepared.permit is None
+                or purpose in {"compaction", "image", "synthesis"} and prepared.disposition != "LOCAL"):
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        payload = json.loads(prepared.request_json)
+        expected_model = (context.policy.model if prepared.disposition == "LOCAL"
+                          else context.policy.hosted_model)
+        expected_endpoint = (context.policy.local_endpoint if prepared.disposition == "LOCAL"
+                             else context.policy.hosted_endpoint)
+        if (not isinstance(payload, dict) or set(payload) != {"model", "messages", "tools"}
+                or expected_model is None or payload["model"] != expected_model
+                or prepared.endpoint != expected_endpoint
+                or encoded(payload) != prepared.request_json
+                or payload.get("tools") != context.definitions()
+                or not isinstance(payload.get("messages"), list) or not payload["messages"]
+                or payload["messages"][0] != {"role": "system", "content": prompt}):
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        context.assert_execution()
+        result = context.start_operation(lambda: context._backend.dispatch_provider(prepared, context._resolved))
+        context.assert_execution()
+        result = json.loads(encoded(result, limit=256 * 1024))
+        if (not isinstance(result, dict) or result.get("role") != "assistant"
+                or set(result) - {"role", "content", "tool_calls", "reasoning_content"}
+                or result.get("content") is not None and not isinstance(result["content"], str)):
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        return result
+    except Exception:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY") from None
+    finally:
+        if not context._withheld:
+            gate.release()

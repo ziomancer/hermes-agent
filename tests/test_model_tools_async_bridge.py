@@ -16,6 +16,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from tools.image_source import ResolvedImage
+
 import pytest
 
 
@@ -366,19 +368,12 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 return_value=fake_response,
             ),
+            # Image resolution moved out of the legacy download helpers.
+            # Keep this loop-lifecycle witness independent of DNS and HTTP.
             patch(
-                "tools.vision_tools._download_image",
+                "tools.image_source.resolve_image_source",
                 new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
+                return_value=ResolvedImage(b"synthetic image", "image/jpeg", "http"),
             ),
         ):
             result_json = registry.dispatch(
@@ -411,19 +406,12 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 return_value=fake_response,
             ),
+            # Image resolution moved out of the legacy download helpers.
+            # Keep this loop-lifecycle witness independent of DNS and HTTP.
             patch(
-                "tools.vision_tools._download_image",
+                "tools.image_source.resolve_image_source",
                 new_callable=AsyncMock,
-                side_effect=lambda url, dest, **kw: _write_fake_image(dest),
-            ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
-            patch(
-                "tools.vision_tools._image_to_base64_data_url",
-                return_value="data:image/jpeg;base64,abc",
+                return_value=ResolvedImage(b"synthetic image", "image/jpeg", "http"),
             ),
         ):
             args = {"image_url": "https://example.com/cat.png", "question": "Describe"}
@@ -438,10 +426,3 @@ class TestVisionDispatchLoopSafety:
         assert r2.get("success") is True
         assert loop_after_first is loop_after_second, "Loop changed between dispatches"
         assert not loop_after_second.is_closed()
-
-
-def _write_fake_image(dest):
-    """Write minimal bytes so vision_analyze_tool thinks download succeeded."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
-    return dest

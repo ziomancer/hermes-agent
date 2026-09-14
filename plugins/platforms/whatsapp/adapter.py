@@ -16,6 +16,8 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import errno
+import inspect
 import logging
 import os
 import platform
@@ -25,6 +27,7 @@ import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
 from collections import deque
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -40,6 +43,22 @@ logger = logging.getLogger(__name__)
 # Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
+
+
+class _LegacyCutoverReason(str, Enum):
+    PIDFILE_LIVE = "pidfile_live"
+    PIDFILE_UNREADABLE = "pidfile_unreadable"
+    PORT_BUSY = "port_busy"
+    PROBE_FAILED = "probe_failed"
+
+
+def _legacy_cutover_error(reason: _LegacyCutoverReason):
+    from hermes_cli.private_boundary import PrivateBoundaryError
+
+    return PrivateBoundaryError(
+        "PRIVATE_BOUNDARY_LEGACY_CUTOVER_REQUIRED",
+        context={"reason": reason.value},
+    )
 
 
 def _listener_pids_on_port(port: int) -> list:
@@ -390,6 +409,69 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
 
+    # R3a rule 3: this transport carries the private lane when the profile policy
+    # requires it. Activation stays fenced twice: ``privacy_boundary.required``
+    # (a non-required policy captures no boundary at all) and the legacy-cutover
+    # guard ``connect()`` runs before returning.
+    supports_private_boundary = True
+
+    # R3a rule 5 (revision 6.1): content-free per-refusal counter. No message
+    # bytes and no identifiers are kept here, only the number of NOT_READY
+    # delivery refusals observed on this adapter.
+    _private_delivery_refusals: int = 0
+
+    @staticmethod
+    def _build_accepted_event(turn, *, session_ref, principal_ref, chat_type):
+        """Project a privately admitted turn without touching the legacy builder.
+
+        The native boundary supplies these random, epoch-scoped handles after
+        sender/account authorization and durable handoff audit. No native event,
+        reply text, filename, address or cache is accepted by this interface.
+        """
+        from hermes_cli.private_boundary import PrivateBoundaryError
+        from hermes_cli.private_conversation import AcceptedTurn
+        from gateway.session import SessionSource
+
+        if (type(turn) is not AcceptedTurn or len(turn.input_refs) > 12
+                or type(chat_type) is not str or chat_type not in {"dm", "group"}
+                or any(type(value) is not str or re.fullmatch(r"[0-9a-f]{32}", value) is None
+                       for value in (session_ref, principal_ref))):
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        source = SessionSource(platform=Platform.WHATSAPP, chat_id=session_ref,
+                               user_id=principal_ref, chat_type=chat_type)
+        return MessageEvent(text="[private input]", source=source,
+                            message_id=turn.input_refs[0], private_turn=turn)
+
+    async def _accept_native_handoff(self, handoff):
+        from hermes_cli.private_boundary import PrivateBoundaryError
+        runtime = getattr(self, "_private_boundary", None)
+        if runtime is None:
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        runtime.assert_ready()
+        event = self._build_accepted_event(handoff.turn, session_ref=handoff.session_ref,
+                                          principal_ref=handoff.principal_ref, chat_type=handoff.chat_type)
+        await self.handle_message(event)
+
+    async def handle_private_result(self, turn, result) -> None:
+        """R3a rule 5 (revision 6.1): hand the opaque result to the runtime.
+
+        The runtime exposes no ``deliver`` wrapper (Deferred D-2), so the call
+        goes to its ``_implementation``. Exactly the NOT_READY refusal is caught
+        and counted; every other exception propagates so ``dispatch()`` retires
+        the runtime, which is the loud path for an unknown fault. Nothing is
+        logged and nothing but the counter is recorded.
+        """
+        implementation = self._private_boundary._implementation
+        try:
+            outcome = implementation.deliver(turn, result)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except RuntimeError as error:
+            if str(error) == "PRIVATE_BOUNDARY_NOT_READY":
+                self._private_delivery_refusals += 1
+                return
+            raise
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
         # Use shared helper for bridge directory resolution (handles read-only install tree)
@@ -397,7 +479,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
             WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
         self._bridge_process: Optional[subprocess.Popen] = None
-        self._bridge_port: int = config.extra.get("bridge_port", 3000)
+        self._bridge_port: int = int(config.extra.get("bridge_port", 3000))
+        if not 1 <= self._bridge_port <= 65535:
+            raise ValueError("bridge_port must be between 1 and 65535")
         self._bridge_script: Optional[str] = config.extra.get(
             "bridge_script",
             str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
@@ -469,12 +553,69 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return float(default)
         return parsed
 
+    def _guard_private_legacy(self):
+        if getattr(self, "_private_boundary", None) is not None:
+            from hermes_cli.private_boundary import PrivateBoundaryError
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+
+    def _check_private_legacy_cutover(self):
+        """Refuse a live legacy owner/listener without contacting or killing it."""
+        import socket
+
+        pidfile = self._session_path / "bridge.pid"
+        if pidfile.exists():
+            try:
+                with pidfile.open() as stream:
+                    raw = stream.read(128)
+            except OSError:
+                raise _legacy_cutover_error(_LegacyCutoverReason.PIDFILE_UNREADABLE) from None
+            try:
+                lines = raw.splitlines()
+                pid = int(lines[0])
+                recorded_start = int(lines[1]) if len(lines) > 1 else None
+            except (ValueError, IndexError):
+                pid = 0
+                recorded_start = None
+            if pid > 0 and _bridge_pid_is_ours(pid, self._session_path, recorded_start):
+                raise _legacy_cutover_error(_LegacyCutoverReason.PIDFILE_LIVE)
+
+        unavailable_ipv6 = {
+            errno.EAFNOSUPPORT,
+            errno.EPROTONOSUPPORT,
+            errno.EADDRNOTAVAIL,
+            getattr(errno, "ENODEV", -1),
+        }
+        if _listener_pids_on_port(self._bridge_port):
+            raise _legacy_cutover_error(_LegacyCutoverReason.PORT_BUSY)
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    if not _IS_WINDOWS:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if family == socket.AF_INET6:
+                        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    probe.bind((host, self._bridge_port))
+                    probe.listen()
+            except OSError as error:
+                if family == socket.AF_INET6 and error.errno in unavailable_ipv6:
+                    continue
+                reason = (
+                    _LegacyCutoverReason.PORT_BUSY
+                    if error.errno == errno.EADDRINUSE
+                    else _LegacyCutoverReason.PROBE_FAILED
+                )
+                raise _legacy_cutover_error(reason) from None
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
         Start the WhatsApp bridge.
         
         This launches the Node.js bridge process and waits for it to be ready.
         """
+        if getattr(self, "_private_boundary", None) is not None:
+            self._check_private_legacy_cutover()
+            self._mark_connected()
+            return True
         if not check_whatsapp_requirements():
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             self._set_fatal_error(
@@ -787,12 +928,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await self._notify_fatal_error()
         return self.fatal_error_message or message
 
+    async def close_private_transport(self) -> bool:
+        """R3a rule 2: required mode created no process, pidfile or session.
+
+        Mark the adapter disconnected and report the transport closed. No
+        process is killed, no pidfile is unlinked and no session is closed,
+        because ``connect()`` never created any of them.
+        """
+        self._mark_disconnected()
+        return True
+
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         # Flip the shutdown flag BEFORE signalling the child so the exit-check
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
+        if getattr(self, "_private_boundary", None) is not None:
+            self._mark_disconnected()
+            return
         if self._bridge_process:
             try:
                 try:
@@ -850,6 +1004,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -916,6 +1071,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -949,6 +1105,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1003,6 +1160,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         remain gateway-owned and add text fallback plus explicit confirmation
         semantics before approval prompts are ever mapped onto polls.
         """
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1051,6 +1209,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         question and the blocked agent continues. Open-ended clarifies use the
         text fallback so the user's next typed message is captured.
         """
+        self._guard_private_legacy()
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
         if 2 <= len(clean_choices) <= 12:
             result = await self.send_poll(
@@ -1087,6 +1246,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp location pin via the Baileys bridge."""
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1136,6 +1296,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         send path. The bridge media call doesn't use it, matching the
         sibling overrides (send_video / send_voice / send_document).
         """
+        self._guard_private_legacy()
         try:
             local_path = await cache_image_from_url(image_url)
             return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
@@ -1151,6 +1312,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file natively via bridge."""
+        self._guard_private_legacy()
         return await self._send_media_to_bridge(chat_id, image_path, "image", caption)
 
     async def send_video(
@@ -1162,6 +1324,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video natively via bridge — plays inline in WhatsApp."""
+        self._guard_private_legacy()
         return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
 
     async def send_voice(
@@ -1173,6 +1336,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an audio file as a WhatsApp voice message via bridge."""
+        self._guard_private_legacy()
         return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
 
     async def send_document(
@@ -1185,6 +1349,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a document/file as a downloadable attachment via bridge."""
+        self._guard_private_legacy()
         return await self._send_media_to_bridge(
             chat_id, file_path, "document", caption,
             file_name or os.path.basename(file_path),
@@ -1192,6 +1357,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1214,6 +1380,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""
+        self._guard_private_legacy()
         if not self._running or not self._http_session:
             return {"name": "Unknown", "type": "dm"}
         if await self._check_managed_bridge_exit():
@@ -1240,6 +1407,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     
     async def _poll_messages(self) -> None:
         """Poll the bridge for incoming messages."""
+        self._guard_private_legacy()
         import aiohttp
 
         while self._running:
@@ -1397,6 +1565,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
+        self._guard_private_legacy()
         try:
             if not self._should_process_message(data):
                 self._buffer_gated_group_message(data)

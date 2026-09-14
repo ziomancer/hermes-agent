@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -42,6 +43,7 @@ import os
 import sys
 import threading
 import types
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -274,7 +276,7 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider", "private-boundary"}
 
 
 @dataclass
@@ -344,6 +346,44 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        # Private factories are staged on this registration invocation. They
+        # become eligible only after register() returns successfully.
+        self._private_boundary_home = get_hermes_home().resolve()
+        self._private_boundary_staged: list = []
+
+    def register_private_boundary(
+        self, name: str, api_version: int, factory: Callable, *, tools: tuple = (),
+    ) -> None:
+        """Stage a profile-owned factory/catalog without opening private state."""
+        from hermes_cli.private_boundary import BoundaryRegistration, PrivateBoundaryError
+
+        registration = BoundaryRegistration.create(
+            home=self._private_boundary_home, name=name, api_version=api_version,
+            plugin=self.manifest.key or self.manifest.name, factory=factory, tools=tools,
+        )
+        key = (registration.home, registration.name)
+        with self._manager._private_boundary_lock:
+            if (any(r.name == name for r in self._private_boundary_staged)
+                    or key in self._manager._private_boundaries):
+                self._manager._private_boundary_conflicts.add(key)
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_DUPLICATE")
+            self._private_boundary_staged.append(registration)
+
+    def _commit_private_boundaries(self) -> None:
+        from hermes_cli.private_boundary import PrivateBoundaryError
+
+        from tools.registry import registry
+
+        with self._manager._private_boundary_lock:
+            keys = [(r.home, r.name) for r in self._private_boundary_staged]
+            conflicts = set(keys) & self._manager._private_boundaries.keys()
+            if conflicts:
+                self._manager._private_boundary_conflicts.update(conflicts)
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_DUPLICATE")
+            if any(registry.get_entry(t.name) is not None
+                   for r in self._private_boundary_staged for t in r.tools):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_DUPLICATE")
+            self._manager._private_boundaries.update(zip(keys, self._private_boundary_staged))
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -416,6 +456,10 @@ class PluginContext:
         like ``shell_exec`` or ``write_file`` and exfiltrate everything
         the model invokes through it.
         """
+        if self.manifest.kind == "private-boundary" or self._manager._private_boundary_only:
+            from hermes_cli.private_boundary import PrivateBoundaryError
+
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_REGISTRATION_INVALID")
         if override and not self._tool_override_allowed(name):
             plugin_id = self.manifest.key or self.manifest.name
             raise PluginToolOverrideError(
@@ -1245,10 +1289,27 @@ class PluginContext:
 # PluginManager
 # ---------------------------------------------------------------------------
 
+class PrivateBoundaryPluginContext:
+    """Private discovery offers only atomic boundary/catalog registration.
+
+    This is an API separation, not a sandbox for installed Python code.
+    Platform/provider registries and host model calls are absent from this facade.
+    """
+
+    __slots__ = ("_context",)
+
+    def __init__(self, context: PluginContext):
+        self._context = context
+
+    def register_private_boundary(self, name, api_version, factory, *, tools=()):
+        self._context.register_private_boundary(name, api_version, factory, tools=tools)
+
+
 class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, private_boundary_only: bool = False) -> None:
+        self._private_boundary_only = private_boundary_only
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -1271,6 +1332,19 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._private_boundaries: Dict[tuple, Any] = {}
+        self._private_boundary_conflicts: Set[tuple] = set()
+        self._private_boundary_lock = threading.RLock()
+
+    def get_private_boundary_registrations(self, home: str | Path) -> tuple:
+        """Return only factories committed for this exact captured home."""
+        from hermes_cli.private_boundary import PrivateBoundaryError, canonical_home
+
+        captured = canonical_home(home)
+        with self._private_boundary_lock:
+            if any(key[0] == captured for key in self._private_boundary_conflicts):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_DUPLICATE")
+            return tuple(r for (profile, _), r in self._private_boundaries.items() if profile == captured)
 
     # -----------------------------------------------------------------------
     # Public
@@ -1301,6 +1375,9 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            with self._private_boundary_lock:
+                self._private_boundaries.clear()
+                self._private_boundary_conflicts.clear()
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1369,6 +1446,11 @@ class PluginManager:
         ep_manifests = self._scan_entry_points()
         logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
         manifests.extend(ep_manifests)
+
+        if self._private_boundary_only:
+            # Per-profile boundary discovery must not refresh global tools,
+            # platform handlers or ordinary plugins for another profile.
+            manifests = [m for m in manifests if m.kind == "private-boundary"]
 
         # Load each manifest (skip user-disabled plugins).
         # Later sources override earlier ones on key collision — user
@@ -1754,15 +1836,22 @@ class PluginManager:
         )
 
         from tools.registry import registry as _registry
+        private = self._private_boundary_only or manifest.kind == "private-boundary"
+        # A private discovery attempt owns its entire module tree. Separate
+        # successful attempts also preserve earlier factories' relative imports.
+        private_module_name = None
+        if private and manifest.source in {"user", "project", "bundled"}:
+            private_module_name = self._directory_module_name(manifest)
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
-        _registry.register_plugin_override_policy(
-            f"{_NS_PARENT}.{_slug}",
-            PluginContext(manifest, self)._tool_override_allowed(""),
-        )
+        if not private:
+            _registry.register_plugin_override_policy(
+                f"{_NS_PARENT}.{_slug}",
+                PluginContext(manifest, self)._tool_override_allowed(""),
+            )
         try:
             if manifest.source in {"user", "project", "bundled"}:
-                module = self._load_directory_module(manifest)
+                module = self._load_directory_module(manifest, module_name=private_module_name)
             else:
                 module = self._load_entrypoint_module(manifest)
 
@@ -1789,7 +1878,7 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
-                register_fn(ctx)
+                register_fn(PrivateBoundaryPluginContext(ctx) if private else ctx)
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
@@ -1808,7 +1897,6 @@ class PluginManager:
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
-                loaded.enabled = True
                 logger.debug(
                     "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
@@ -1820,16 +1908,39 @@ class PluginManager:
                         if self._cli_commands[c].get("plugin") == manifest.name
                     ),
                 )
+                ctx._commit_private_boundaries()
+                loaded.enabled = True
 
         except Exception as exc:
-            loaded.error = str(exc)
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name, exc, exc_info=_PLUGINS_DEBUG,
-            )
+            if private:
+                loaded.error = "PRIVATE_BOUNDARY_REGISTRATION_INVALID"
+                logger.warning("PRIVATE_BOUNDARY_REGISTRATION_INVALID")
+            else:
+                loaded.error = str(exc)
+                logger.warning(
+                    "Failed to load plugin '%s': %s",
+                    manifest.name, exc, exc_info=_PLUGINS_DEBUG,
+                )
+        finally:
+            if private_module_name is not None and not loaded.enabled:
+                for name in tuple(sys.modules):
+                    if name == private_module_name or name.startswith(private_module_name + "."):
+                        del sys.modules[name]
+                loaded.module = None
         self._plugins[manifest.key or manifest.name] = loaded
 
-    def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
+    def _directory_module_name(self, manifest: PluginManifest) -> str:
+        key = manifest.key or manifest.name
+        if self._private_boundary_only or manifest.kind == "private-boundary":
+            identity = f"{get_hermes_home().resolve()}\0{key}\0{Path(manifest.path).resolve()}"
+            slug = "p_" + hashlib.sha256(identity.encode()).hexdigest()
+            return f"hermes_private_plugins.{slug}_{uuid.uuid4().hex}"
+        slug = key.replace("/", "__").replace("-", "_")
+        return f"{_NS_PARENT}.{slug}"
+
+    def _load_directory_module(
+        self, manifest: PluginManifest, *, module_name: str | None = None,
+    ) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
 
         The module slug is derived from ``manifest.key`` so category-namespaced
@@ -1842,16 +1953,15 @@ class PluginManager:
         if not init_file.exists():
             raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
 
+        module_name = module_name or self._directory_module_name(manifest)
+        parent = module_name.rpartition(".")[0]
         # Ensure the namespace parent package exists
-        if _NS_PARENT not in sys.modules:
-            ns_pkg = types.ModuleType(_NS_PARENT)
+        if parent not in sys.modules:
+            ns_pkg = types.ModuleType(parent)
             ns_pkg.__path__ = []  # type: ignore[attr-defined]
-            ns_pkg.__package__ = _NS_PARENT
-            sys.modules[_NS_PARENT] = ns_pkg
+            ns_pkg.__package__ = parent
+            sys.modules[parent] = ns_pkg
 
-        key = manifest.key or manifest.name
-        slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,

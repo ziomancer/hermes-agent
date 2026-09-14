@@ -1,0 +1,1385 @@
+{
+  "$defs": {
+    "activate_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "activate"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "contract_digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "required": [
+            "contract_digest"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "activate_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "activate"
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "const": "ACTIVE"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "artifact_commit_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "artifact_commit"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "context": {
+              "$ref": "#/$defs/op_context"
+            },
+            "ticket": {
+              "$ref": "#/$defs/id"
+            },
+            "audit_ref": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "context",
+            "ticket",
+            "audit_ref"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "artifact_commit_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "artifact_commit"
+        },
+        "result": {
+          "$ref": "#/$defs/delivery_result"
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "artifact_prepare_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "artifact_prepare"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "context": {
+              "$ref": "#/$defs/op_context"
+            },
+            "handle": {
+              "$ref": "#/$defs/id"
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 16777216
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "mime": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 128,
+              "x-maxUtf8Bytes": 128
+            },
+            "file_name": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 1024,
+              "x-maxUtf8Bytes": 1024
+            },
+            "reply": {
+              "$ref": "#/$defs/reply"
+            }
+          },
+          "required": [
+            "context",
+            "handle",
+            "size",
+            "sha256",
+            "mime",
+            "file_name",
+            "reply"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 262144
+    },
+    "artifact_prepare_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "artifact_prepare"
+        },
+        "result": {
+          "$ref": "#/$defs/delivery_result"
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "bool": {
+      "type": "boolean"
+    },
+    "cancel_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "cancel"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "operation_id": {
+              "$ref": "#/$defs/id"
+            },
+            "purpose": {
+              "type": "string",
+              "enum": [
+                "admission",
+                "poll",
+                "delivery"
+              ]
+            },
+            "ticket": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/id"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "submission_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/id"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "envelope_digest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/digest"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "operation_id",
+            "purpose",
+            "ticket",
+            "submission_id",
+            "envelope_digest"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "cancel_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "cancel"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "operation_id": {
+                  "$ref": "#/$defs/id"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "cancelling",
+                    "cancelled",
+                    "unknown",
+                    "sent"
+                  ]
+                },
+                "prior_dispatch_possible": {
+                  "$ref": "#/$defs/bool"
+                },
+                "producers_joined": {
+                  "$ref": "#/$defs/bool"
+                }
+              },
+              "required": [
+                "operation_id",
+                "state",
+                "prior_dispatch_possible",
+                "producers_joined"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "$ref": "#/$defs/settled_delivery"
+            }
+          ]
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "delivery_result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/unsettled_delivery_result"
+        },
+        {
+          "$ref": "#/$defs/settled_delivery"
+        }
+      ]
+    },
+    "delivery_settle_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "delivery_settle"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "operation_id": {
+              "$ref": "#/$defs/id"
+            },
+            "outcome_digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "durable_outcome_ref": {
+              "$ref": "#/$defs/id"
+            },
+            "cleanup_ref": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "operation_id",
+            "outcome_digest",
+            "durable_outcome_ref",
+            "cleanup_ref"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "delivery_settle_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "delivery_settle"
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "operation_id": {
+              "$ref": "#/$defs/id"
+            },
+            "outcome_digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "state": {
+              "const": "settled"
+            }
+          },
+          "required": [
+            "operation_id",
+            "outcome_digest",
+            "state"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "delivery_state_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "delivery_state"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "operation_id": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "operation_id"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "delivery_state_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "delivery_state"
+        },
+        "result": {
+          "$ref": "#/$defs/delivery_result"
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "delivery_tombstone": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "purpose": {
+          "const": "delivery"
+        },
+        "request_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settle_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ticket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "fenced",
+            "cancelled",
+            "unknown",
+            "sent"
+          ]
+        },
+        "prior_dispatch_possible": {
+          "type": "boolean"
+        },
+        "quiesced": {
+          "type": "boolean"
+        },
+        "never_dispatched": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation_id",
+        "purpose",
+        "request_digest",
+        "outcome_digest",
+        "settle_digest",
+        "ticket",
+        "state",
+        "prior_dispatch_possible",
+        "quiesced",
+        "never_dispatched"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 512,
+      "x-semantic-validator": "delivery_state.validate / delivery-state.mjs validate; delivery-state-contract.md"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "code": {
+          "$ref": "#/$defs/reason"
+        }
+      },
+      "required": [
+        "v",
+        "request_id",
+        "code"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 1024
+    },
+    "health_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "health"
+        },
+        "data": {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "health_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "health"
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "runtime": {
+              "type": "string",
+              "enum": [
+                "RECOVERING",
+                "READY",
+                "RETIRING",
+                "CLOSED"
+              ]
+            },
+            "bridge": {
+              "type": "string",
+              "enum": [
+                "SUSPENDED",
+                "ACTIVE",
+                "DRAINING",
+                "CLOSED"
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/reason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "transport_ready": {
+              "$ref": "#/$defs/bool"
+            },
+            "contract_digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "required": [
+            "runtime",
+            "bridge",
+            "reason",
+            "transport_ready",
+            "contract_digest"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "key": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "minLength": 1
+        },
+        "remote_jid": {
+          "type": "string",
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "minLength": 1
+        },
+        "participant": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "x-maxUtf8Bytes": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from_me": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "remote_jid",
+        "participant",
+        "from_me"
+      ],
+      "additionalProperties": false
+    },
+    "op_context": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "conversation_ref": {
+          "$ref": "#/$defs/id"
+        },
+        "epoch": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "operation_id",
+        "conversation_ref",
+        "epoch"
+      ],
+      "additionalProperties": false
+    },
+    "poll_send_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "poll_send"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "context": {
+              "$ref": "#/$defs/op_context"
+            },
+            "poll_ref": {
+              "$ref": "#/$defs/id"
+            },
+            "question": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 2048,
+              "x-maxUtf8Bytes": 2048
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "x-maxUtf8Bytes": 256
+              },
+              "minItems": 1,
+              "maxItems": 12
+            },
+            "selectable_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 12
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 44,
+              "x-maxUtf8Bytes": 44,
+              "x-base64DecodedBytes": 32
+            },
+            "audit_ref": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "context",
+            "poll_ref",
+            "question",
+            "options",
+            "selectable_count",
+            "secret",
+            "audit_ref"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 65536
+    },
+    "poll_send_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "poll_send"
+        },
+        "result": {
+          "$ref": "#/$defs/delivery_result"
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "invalid_schema",
+        "invalid_context",
+        "not_ready",
+        "capacity",
+        "expired",
+        "conflict",
+        "cancelled",
+        "unknown",
+        "not_found",
+        "integrity",
+        "audit_fault",
+        "storage_fault",
+        "transport_fault"
+      ]
+    },
+    "reply": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/key"
+            },
+            "text": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 32768,
+              "x-maxUtf8Bytes": 32768
+            },
+            "native_kind": {
+              "type": "string",
+              "enum": [
+                "text",
+                "image",
+                "video",
+                "audio",
+                "document",
+                "sticker",
+                "poll"
+              ]
+            }
+          },
+          "required": [
+            "key",
+            "text",
+            "native_kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sent_key": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/key"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "settled_delivery": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "state": {
+          "const": "settled"
+        },
+        "outcome_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "required": [
+        "operation_id",
+        "state",
+        "outcome_digest"
+      ],
+      "additionalProperties": false
+    },
+    "text_send_request": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "op": {
+          "const": "text_send"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "context": {
+              "$ref": "#/$defs/op_context"
+            },
+            "text": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 32768,
+              "x-maxUtf8Bytes": 32768
+            },
+            "reply": {
+              "$ref": "#/$defs/reply"
+            },
+            "audit_ref": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "context",
+            "text",
+            "reply",
+            "audit_ref"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "op",
+        "data"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 524288
+    },
+    "text_send_response": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 5
+        },
+        "profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "generation": {
+          "$ref": "#/$defs/id"
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "op": {
+          "const": "text_send"
+        },
+        "result": {
+          "$ref": "#/$defs/delivery_result"
+        }
+      },
+      "required": [
+        "v",
+        "profile_id",
+        "generation",
+        "request_id",
+        "request_digest",
+        "op",
+        "result"
+      ],
+      "additionalProperties": false,
+      "x-maxEncodedBytes": 8192
+    },
+    "unsettled_delivery_result": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "prepared",
+            "dispatch_started",
+            "sent",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "ticket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sent_key": {
+          "$ref": "#/$defs/sent_key"
+        },
+        "proof": {
+          "type": "string",
+          "enum": [
+            "none",
+            "never_dispatched",
+            "joined",
+            "sent"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "state",
+        "ticket",
+        "sent_key",
+        "proof"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "x-endpoints": {
+    "health": {
+      "method": "POST",
+      "path": "/health",
+      "lane": "owner",
+      "request": "health_request",
+      "response": "health_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    },
+    "activate": {
+      "method": "POST",
+      "path": "/activate",
+      "lane": "owner",
+      "request": "activate_request",
+      "response": "activate_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    },
+    "text_send": {
+      "method": "POST",
+      "path": "/text-send",
+      "lane": "control",
+      "request": "text_send_request",
+      "response": "text_send_response",
+      "request_bytes": 524288,
+      "response_bytes": 8192
+    },
+    "poll_send": {
+      "method": "POST",
+      "path": "/poll-send",
+      "lane": "control",
+      "request": "poll_send_request",
+      "response": "poll_send_response",
+      "request_bytes": 65536,
+      "response_bytes": 8192
+    },
+    "artifact_prepare": {
+      "method": "POST",
+      "path": "/artifact-prepare",
+      "lane": "bulk",
+      "request": "artifact_prepare_request",
+      "response": "artifact_prepare_response",
+      "request_bytes": 262144,
+      "response_bytes": 8192,
+      "stream": {
+        "direction": "request",
+        "content_type": "application/vnd.private-boundary.stream",
+        "metadata_length_prefix": "uint32-big-endian",
+        "metadata_schema": "artifact_prepare_request",
+        "metadata_max_bytes": 262144,
+        "max_bytes": 16777216,
+        "max_frame_bytes": 17039364,
+        "chunk_bytes": 65536,
+        "retry": "same operation lookup only; no second spool"
+      }
+    },
+    "artifact_commit": {
+      "method": "POST",
+      "path": "/artifact-commit",
+      "lane": "control",
+      "request": "artifact_commit_request",
+      "response": "artifact_commit_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    },
+    "delivery_state": {
+      "method": "POST",
+      "path": "/delivery-state",
+      "lane": "control",
+      "request": "delivery_state_request",
+      "response": "delivery_state_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    },
+    "delivery_settle": {
+      "method": "POST",
+      "path": "/delivery-settle",
+      "lane": "control",
+      "request": "delivery_settle_request",
+      "response": "delivery_settle_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    },
+    "cancel": {
+      "method": "POST",
+      "path": "/cancel",
+      "lane": "owner",
+      "request": "cancel_request",
+      "response": "cancel_response",
+      "request_bytes": 8192,
+      "response_bytes": 8192
+    }
+  }
+}
