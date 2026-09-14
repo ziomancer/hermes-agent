@@ -1682,7 +1682,7 @@ def anthropic_prompt_cache_policy(
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-    if getattr(agent, "_private_boundary_context", None) is not None:
+    if vars(agent).get("_private_boundary_context") is not None:
         from hermes_cli.private_boundary import PrivateBoundaryError
         raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls

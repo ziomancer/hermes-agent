@@ -489,7 +489,7 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
-    if getattr(agent, "_private_boundary_context", None) is not None:
+    if vars(agent).get("_private_boundary_context") is not None:
         from hermes_cli.private_boundary import PrivateBoundaryError
         raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
     # Codex app-server sessions: the codex agent owns the real thread context;

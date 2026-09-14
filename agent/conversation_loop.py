@@ -572,7 +572,7 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if getattr(agent, "_private_boundary_context", None) is not None:
+    if vars(agent).get("_private_boundary_context") is not None:
         from agent.private_conversation import run_private_conversation
         return run_private_conversation(
             agent, user_message, system_message=system_message,

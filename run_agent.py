@@ -714,7 +714,7 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         # Token usage counters
@@ -800,7 +800,7 @@ class AIAgent:
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         from agent.agent_runtime_helpers import switch_model
@@ -1697,7 +1697,7 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         # Scaffolding removal mutates the live list (desired — ephemeral
@@ -2621,7 +2621,7 @@ class AIAgent:
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         if not getattr(self, "_session_json_enabled", False):
@@ -2727,7 +2727,7 @@ class AIAgent:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             self._private_boundary_context.cancel()
             self._interrupt_requested = True
             return
@@ -5061,7 +5061,7 @@ class AIAgent:
         Lazy-initializes on first call per api_mode. Returns None if no
         transport is registered for the mode.
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         mode = api_mode or self.api_mode
@@ -5687,7 +5687,7 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             from hermes_cli.private_boundary import PrivateBoundaryError
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
         from agent.conversation_compression import compress_context

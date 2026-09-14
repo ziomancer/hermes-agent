@@ -1925,7 +1925,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
-        if getattr(self, "_private_boundary_context", None) is not None:
+        if vars(self).get("_private_boundary_context") is not None:
             result = self._private_boundary_context.provider_call(
                 turns_to_summarize, purpose="compaction",
             )
@@ -3178,7 +3178,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         for i in range(compress_start):
             msg = _fresh_compaction_message_copy(messages[i])
             if (i == 0 and msg.get("role") == "system"
-                    and getattr(self, "_private_boundary_context", None) is None):
+                    and vars(self).get("_private_boundary_context") is None):
                 existing = msg.get("content")
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
                 if _compression_note not in _content_text_for_contains(existing):
