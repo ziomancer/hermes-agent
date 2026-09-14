@@ -9208,11 +9208,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         private_home = canonical_home(
             get_hermes_home_override() or getattr(self, "_private_boundary_home", get_hermes_home())
         )
-        if self._private_boundary_owners.requires_boundary(private_home):
+        owners = getattr(self, "_private_boundary_owners", None)
+        if owners is None:
+            owners = BoundaryRuntimeOwners()
+            self._private_boundary_owners = owners
+        if owners.requires_boundary(private_home):
             from hermes_cli.private_conversation import AcceptedTurn
             if not isinstance(getattr(event, "private_turn", None), AcceptedTurn):
                 raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
-            runtime = self._private_boundary_owners.get_or_open(private_home)
+            runtime = owners.get_or_open(private_home)
 
             def create_agent(context):
                 from run_agent import AIAgent
