@@ -616,3 +616,10 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )
+
+
+def build_private_turn_context(agent, accepted_turn):
+    """Claim and resolve the complete private turn before any optional prologue."""
+    from hermes_cli.private_conversation import require_conversation
+    context = require_conversation(agent._private_boundary_context)
+    return context.begin(accepted_turn, getattr(agent, "_private_turn_cancel", None))

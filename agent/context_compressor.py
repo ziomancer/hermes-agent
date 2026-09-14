@@ -1133,7 +1133,16 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        boundary_context=None,
     ):
+        from hermes_constants import get_hermes_home
+        from hermes_cli.private_boundary import load_boundary_policy, PrivateBoundaryError
+        if boundary_context is None and load_boundary_policy(get_hermes_home()).required:
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        if boundary_context is not None:
+            from hermes_cli.private_conversation import require_conversation
+            require_conversation(boundary_context)
+        self._private_boundary_context = boundary_context
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -1916,6 +1925,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        if vars(self).get("_private_boundary_context") is not None:
+            result = self._private_boundary_context.provider_call(
+                turns_to_summarize, purpose="compaction",
+            )
+            from hermes_cli.private_boundary import PrivateBoundaryError
+            if result.get("tool_calls") or not result.get("content"):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_NOT_READY")
+            return result["content"]
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -3160,7 +3177,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         compressed = []
         for i in range(compress_start):
             msg = _fresh_compaction_message_copy(messages[i])
-            if i == 0 and msg.get("role") == "system":
+            if (i == 0 and msg.get("role") == "system"
+                    and vars(self).get("_private_boundary_context") is None):
                 existing = msg.get("content")
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
                 if _compression_note not in _content_text_for_contains(existing):

@@ -1769,6 +1769,8 @@ class MessageEvent:
     # ("Error while calling `get_updates` one more time to mark all fetched
     # updates" in gateway.log).
     platform_update_id: Optional[int] = None
+    # Set only by a required adapter after authenticated private admission.
+    private_turn: Any = field(default=None, repr=False)
     
     # Media attachments
     # media_urls: local file paths (for vision tool access)
@@ -2353,7 +2355,21 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
+    # A concrete adapter opts in only after implementing all required ingress
+    # and egress paths. Ordinary adapters refuse before creating legacy caches.
+    supports_private_boundary: bool = False
+
     def __init__(self, config: PlatformConfig, platform: Platform):
+        from hermes_cli.private_boundary import capture_adapter_boundary
+
+        self._private_boundary = capture_adapter_boundary(
+            get_hermes_home(), supported=self.supports_private_boundary,
+        )
+        if self._private_boundary is not None:
+            self._private_transport_generation = uuid.uuid4().hex
+            self._private_disconnect_task = None
+            self._private_transport_released = False
+            self._private_boundary.bind_transport(self, self._private_transport_generation)
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
@@ -2891,6 +2907,16 @@ class BasePlatformAdapter(ABC):
         """
         self._session_store = session_store
     
+    async def close_private_transport(self) -> bool:
+        """Join every owned producer before returning True; cancellation is not join.
+
+        Required adapters implement this against their concrete process/worker
+        owners. The generic base cannot infer completion from legacy disconnect.
+        """
+        from hermes_cli.private_boundary import PrivateBoundaryError
+
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -4638,6 +4664,11 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    async def handle_private_result(self, turn, result) -> None:
+        """Required transports deliver opaque references through their controller."""
+        from hermes_cli.private_boundary import PrivateBoundaryError
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -4646,6 +4677,19 @@ class BasePlatformAdapter(ABC):
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
+        if getattr(self, "_private_boundary", None) is not None:
+            from hermes_cli.private_conversation import AcceptedTurn
+            from hermes_cli.private_boundary import PrivateBoundaryError
+            self._private_boundary.assert_ready()
+            if not isinstance(event.private_turn, AcceptedTurn) or not self._message_handler:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+            if type(self).handle_private_result is BasePlatformAdapter.handle_private_result:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
+            # Required context/control handoffs bypass both ordinary busy guards.
+            # The native private controller consumes the opaque result; no
+            # ordinary retry, text formatting, auto-send or callback runs here.
+            self._private_boundary.submit_handoff(event, self._message_handler, self.handle_private_result)
+            return
         if not self._message_handler:
             return
 

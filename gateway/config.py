@@ -984,6 +984,11 @@ def load_gateway_config() -> GatewayConfig:
     4. Built-in defaults
     """
     _home = get_hermes_home()
+    # Inspect raw YAML before permissive legacy/config fallback can hide a
+    # malformed required selector. The returned policy remains profile-owned.
+    from hermes_cli.private_boundary import load_boundary_policy
+
+    load_boundary_policy(_home)
     gw_data: dict = {}
 
     # Legacy fallback: gateway.json provides the base layer.

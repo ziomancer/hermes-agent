@@ -346,6 +346,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    boundary_context=None,
 ):
     """
     Initialize the AI Agent.
@@ -396,6 +397,44 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    from hermes_cli.private_boundary import load_boundary_policy, PrivateBoundaryError
+    policy = load_boundary_policy(get_hermes_home())
+    if boundary_context is not None:
+        from hermes_cli.runtime_provider import create_private_runtime_provider
+        context = create_private_runtime_provider(boundary_context)
+        if context.runtime.home != get_hermes_home().resolve():
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        if type(max_iterations) is not int or not 1 <= max_iterations <= 90:
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+        agent._private_boundary_context = context
+        agent.model = context.policy.model
+        agent.provider = "private-boundary"
+        agent.api_mode = "private-boundary"
+        agent.base_url = ""
+        agent.api_key = ""
+        agent.client = None
+        agent.max_iterations = max_iterations
+        agent.session_id = context.binding.session_id
+        agent._cached_system_prompt = context.policy.system_prompt
+        agent.tools = _ra().get_tool_definitions(boundary_context=context)
+        agent.valid_tool_names = context.allowed_names
+        agent._session_db = None
+        agent._persist_disabled = True
+        agent._memory_manager = None
+        agent._interrupt_requested = False
+        agent._last_messages = []
+        agent.quiet_mode = True
+        agent.verbose_logging = False
+        agent.save_trajectories = False
+        agent.platform = platform
+        agent.context_compressor = ContextCompressor(
+            model=context.policy.model, config_context_length=context.policy.context_length,
+            quiet_mode=True, abort_on_summary_failure=True, boundary_context=context,
+        )
+        return
+    if policy.required:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_CONTEXT_INVALID")
+    agent._private_boundary_context = None
     _install_safe_stdio()
 
     agent.model = model
