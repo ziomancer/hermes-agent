@@ -68,6 +68,15 @@ from hermes_cli.private_boundary import (
 
 _PRIVATE_BOUNDARY_JOIN_TIMEOUT = 30.0
 
+
+def _explicit_instance_attr(instance: object, name: str) -> Any:
+    """Read instance-owned state without triggering dynamic mock attributes."""
+    try:
+        namespace = object.__getattribute__(instance, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    return namespace.get(name)
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -3461,7 +3470,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Must tolerate partial-init state and never raise, since callers
         use it inside error-handling blocks.
         """
-        if vars(adapter).get("_private_boundary") is not None:
+        if _explicit_instance_attr(adapter, "_private_boundary") is not None:
             try:
                 await self._disconnect_private_adapter(adapter)
             except PrivateBoundaryError:
@@ -3503,7 +3512,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         and force forward progress; the loop never hangs regardless of any
         adapter's internal behavior. Never raises.
         """
-        if vars(adapter).get("_private_boundary") is not None:
+        if _explicit_instance_attr(adapter, "_private_boundary") is not None:
             await self._safe_adapter_disconnect(adapter, platform)
             return
         timeout = self._adapter_disconnect_timeout_secs()
@@ -3576,7 +3585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _connect_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False
     ) -> bool:
-        runtime = vars(adapter).get("_private_boundary")
+        runtime = _explicit_instance_attr(adapter, "_private_boundary")
         if runtime is None:
             return await self._connect_platform_adapter_with_timeout(
                 adapter, platform, is_reconnect=is_reconnect,
@@ -4211,7 +4220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the same object twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
-            if vars(adapter).get("_private_boundary") is not None:
+            if _explicit_instance_attr(adapter, "_private_boundary") is not None:
                 try:
                     await self._disconnect_private_adapter(adapter)
                 except PrivateBoundaryError as exc:
@@ -8895,7 +8904,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         owner, profile_name, platform.value, platform.value,
                     )
                     await self._safe_adapter_disconnect(adapter, platform)
-                    if vars(adapter).get("_private_boundary") is not None:
+                    if _explicit_instance_attr(adapter, "_private_boundary") is not None:
                         raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
                     continue
                 claimed[(platform, fp)] = profile_name
@@ -8987,7 +8996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             with boundary_construction_scope(runtime):
                 adapter = self._create_platform_adapter(platform, config)
-            if (adapter is None or vars(adapter).get("_private_boundary") is not runtime
+            if (adapter is None or _explicit_instance_attr(adapter, "_private_boundary") is not runtime
                     or not getattr(adapter, "supports_private_boundary", False)):
                 raise PrivateBoundaryError("PRIVATE_BOUNDARY_TRANSPORT_UNAVAILABLE")
             return adapter
@@ -19039,7 +19048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return f"[user did not respond within {int(timeout / 60)}m]"
                 return response
 
-            if vars(_status_adapter).get("_private_boundary") is None:
+            if _explicit_instance_attr(_status_adapter, "_private_boundary") is None:
                 agent.clarify_callback = _clarify_callback_sync
 
             # Show assistant thinking between tool calls — independent of
