@@ -766,10 +766,15 @@ def _read_logging_config():
     """
     try:
         from utils import fast_safe_load
+        from hermes_cli.private_boundary import PrivateBoundaryError, _read_policy_config
+
         config_path = get_config_path()
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = fast_safe_load(f) or {}
+        try:
+            config_text = _read_policy_config(config_path.parent)
+        except PrivateBoundaryError:
+            config_text = None
+        if config_text is not None:
+            cfg = fast_safe_load(config_text) or {}
             # Managed scope: an administrator can pin logging.* too. Overlay via
             # the shared helper (fail-open) since this reads config.yaml directly.
             try:

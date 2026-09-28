@@ -298,11 +298,6 @@ def _load_hermes_env() -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
 
-    # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
-    # gateway config loader (invoked downstream by send_message_tool and by
-    # the channel directory) can see platform credentials and home channels.
-    _load_hermes_env()
-
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
         # When `--list telegram` is used, argparse stores "telegram" in the
@@ -322,6 +317,24 @@ def cmd_send(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(_USAGE_EXIT)
+
+    if target.split(":", 1)[0].strip().lower() == "whatsapp":
+        from hermes_cli.private_boundary import (
+            LEGACY_WHATSAPP_SEND_REFUSAL,
+            legacy_whatsapp_send_refused,
+        )
+
+        if legacy_whatsapp_send_refused():
+            exit_code = _emit_result(
+                json.dumps({"error": LEGACY_WHATSAPP_SEND_REFUSAL}),
+                json_mode=getattr(args, "json", False),
+                quiet=getattr(args, "quiet", False),
+            )
+            sys.exit(exit_code)
+
+    # Resolve the privacy policy before any config bridge can read config.yaml.
+    # The bridge remains available to ordinary sending and target resolution.
+    _load_hermes_env()
 
     message = _read_message_body(
         getattr(args, "message", None),

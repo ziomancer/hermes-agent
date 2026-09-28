@@ -381,16 +381,20 @@ def _load_secrets_config(home_path: Path) -> dict:
     Imported lazily and isolated from the main config loader so a
     malformed config can't take down dotenv loading entirely.
     """
-    config_path = home_path / "config.yaml"
-    if not config_path.exists():
+    from hermes_cli.private_boundary import PrivateBoundaryError, _read_policy_config
+
+    try:
+        raw = _read_policy_config(home_path)
+    except PrivateBoundaryError:
+        return {}  # The later policy guard reports unsafe config to the caller.
+    if raw is None:
         return {}
     try:
         import yaml  # type: ignore
     except ImportError:
         return {}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+        data = fast_safe_load(raw) or {}
     except Exception:  # noqa: BLE001
         return {}
     return data.get("secrets") or {}

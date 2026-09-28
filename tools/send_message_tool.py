@@ -355,12 +355,21 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
-    if not target or not message:
+    if not target:
         return tool_error("Both 'target' and 'message' are required when action='send'")
-
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None
+    if platform_name == "whatsapp":
+        from hermes_cli.private_boundary import (
+            LEGACY_WHATSAPP_SEND_REFUSAL,
+            legacy_whatsapp_send_refused,
+        )
+
+        if legacy_whatsapp_send_refused():
+            return tool_error(LEGACY_WHATSAPP_SEND_REFUSAL)
+    if not target or not message:
+        return tool_error("Both 'target' and 'message' are required when action='send'")
     chat_id = None
     thread_id = None
 
@@ -784,6 +793,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
+
+    if platform == Platform.WHATSAPP:
+        from hermes_cli.private_boundary import (
+            LEGACY_WHATSAPP_SEND_REFUSAL,
+            legacy_whatsapp_send_refused,
+        )
+
+        if legacy_whatsapp_send_refused():
+            return {"error": LEGACY_WHATSAPP_SEND_REFUSAL}
 
     media_files = media_files or []
 

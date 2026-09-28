@@ -1825,6 +1825,14 @@ async def _standalone_send(
     ``/send-media`` ``caption`` field instead of being posted as a separate
     ``/send`` message beforehand.
     """
+    from hermes_cli.private_boundary import (
+        LEGACY_WHATSAPP_SEND_REFUSAL,
+        legacy_whatsapp_send_refused,
+    )
+
+    if legacy_whatsapp_send_refused():
+        return {"error": LEGACY_WHATSAPP_SEND_REFUSAL}
+
     extra = getattr(pconfig, "extra", {}) or {}
     try:
         import aiohttp

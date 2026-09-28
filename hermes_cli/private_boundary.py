@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import re
+import stat
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -22,7 +23,9 @@ from typing import Any, Callable, Mapping
 import yaml
 
 BOUNDARY_API_VERSION = 1
+LEGACY_WHATSAPP_SEND_REFUSAL = "This profile sends only through the private lane."
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+MAX_POLICY_CONFIG_BYTES = 1024 * 1024
 
 
 class PrivateBoundaryError(RuntimeError):
@@ -57,6 +60,39 @@ def canonical_home(home: str | Path) -> Path:
         raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
 
 
+def _read_policy_config(home: Path) -> str | None:
+    """Read a regular config in the captured home without following links."""
+    path = home / "config.yaml"
+    try:
+        entry = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
+    if (not stat.S_ISREG(entry.st_mode) or not entry.st_mode & 0o444
+            or entry.st_size > MAX_POLICY_CONFIG_BYTES):
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode) or not opened.st_mode & 0o444
+                    or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+                    or opened.st_size > MAX_POLICY_CONFIG_BYTES):
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                raw = stream.read(MAX_POLICY_CONFIG_BYTES + 1)
+            if len(raw) > MAX_POLICY_CONFIG_BYTES:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
+            return raw.decode("utf-8")
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeError):
+        raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
+
+
 def _policy_section(home: Path) -> object:
     """Read only the named policy; reject ambiguous YAML at that boundary.
 
@@ -64,17 +100,34 @@ def _policy_section(home: Path) -> object:
     duplicate privacy keys must remain observable even if a later value is false.
     Ordinary plugin configuration is not interpreted here.
     """
-    try:
-        raw = (home / "config.yaml").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    raw = _read_policy_config(home)
+    if raw is None:
         return None
-    except (OSError, UnicodeError):
+    try:
+        loader = yaml.SafeLoader(raw)
+    except Exception:
         raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
-    loader = yaml.SafeLoader(raw)
     try:
         root = loader.get_single_node()
         if root is None:
             return None
+        # Limit work before constructing aliases or merged values. The byte
+        # limit also caps the parser's token input; this caps node traversal.
+        pending = [(root, 0)]
+        seen = set()
+        while pending:
+            node, depth = pending.pop()
+            if depth > 100:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if len(seen) > 10000:
+                raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
+            if isinstance(node, yaml.MappingNode):
+                pending.extend((child, depth + 1) for pair in node.value for child in pair)
+            elif isinstance(node, yaml.SequenceNode):
+                pending.extend((child, depth + 1) for child in node.value)
         if not isinstance(root, yaml.MappingNode):
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
         if any(key.value == "<<" for key, _ in root.value):
@@ -93,10 +146,13 @@ def _policy_section(home: Path) -> object:
         if len(keys) != len(set(keys)) or "<<" in keys:
             raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID")
         return loader.construct_object(nodes[0], deep=True)
-    except (yaml.YAMLError, TypeError, ValueError, AttributeError):
+    except Exception:
         raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
     finally:
-        loader.dispose()
+        try:
+            loader.dispose()
+        except Exception:
+            raise PrivateBoundaryError("PRIVATE_BOUNDARY_POLICY_INVALID") from None
 
 
 @dataclass(frozen=True)
@@ -130,6 +186,16 @@ def load_boundary_policy(home: str | Path) -> BoundaryPolicy:
         sort_keys=True, separators=(",", ":"),
     ).encode()
     return BoundaryPolicy(captured, required, adapter, version, hashlib.sha256(encoded).hexdigest())
+
+
+def legacy_whatsapp_send_refused() -> bool:
+    """Fail closed for a required or unreadable policy in the active home."""
+    from hermes_constants import get_hermes_home
+
+    try:
+        return load_boundary_policy(get_hermes_home()).required
+    except PrivateBoundaryError:
+        return True
 
 
 @dataclass(frozen=True)
